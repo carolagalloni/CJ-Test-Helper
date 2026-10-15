@@ -63,9 +63,20 @@ only then is `expected.json` changed (in the same commit). A failing example is 
 | `operators_text` | `BeginsWith`, `EndsWith`, `Contains`, `NotEqual` on a Text, four splits in series | 1 / 5 / 15; the remainder of `NotEqual` is exactly `BLOCKED` |
 | `pilot` | The spec's acceptance criteria on the real export (default settings + real inbox) | >= 23 scenarios, >= 33 cases, >= 146 contacts (proven minima); 137 of 259 branches unreachable |
 | `pilot_case_insensitive` | The pilot with case-insensitive text (what the earlier tool assumed) | >= 41 / 59 / 224 (41 is the earlier tool's "40 + 1"); 91 unreachable |
+| `relative_date_after_today` | Step 3: `After ;+;0;days` / `AtOrBefore ;+;0;days` / remainder on a Date | 1 / 3 / 9; T0+2, T0-2, null; validity 1 day (not 2: `After` excludes the bound), deadline 2026-10-12 |
+| `wait_offset_then_relative_split` | Step 3: wait "13 days before EndDate" (offset -13 DAYS), then `EndDate AtOrAfter ;+;13;days` | 1 / 2 / 6; yes only on the bound (T0+14, waits 1 day), remainder T0+11; validity 1, deadline 2026-10-12; day-level note |
+| `exit_criteria_at_wait_end` | Step 3: exit criteria `Status NotEqual 'Active' OR IsDunning Is true` at the end of a 1-day wait | 1 / 2 / 6; remainder not covered (exit criteria); exit target covered by a case ending at WAIT-1 |
+| `exit_criteria_removes_everyone` | Step 3: exit criteria `EndDate IsNotNull OR ...` after a split requiring `EndDate IsNotNull` | 1 / 2 / 6; both branches behind the wait not covered (exit criteria); finding on the journey |
+| `relative_date_chain_waits` | Step 3: Journey Data window [45, 90] days, 2-day wait, window [45, 88] days | 1 / 3 / 9; cut points {45, 47, 90}; T0+43, T0+46, T0+89; SPLIT-2 remainder via T0+46; validity 1 day |
+| `relative_date_before_minus_days` | Step 3: `Before ;-;7;days` / remainder on a nullable Date | 1 / 2 / 6; T0-9 (not perishable), T0-5 (validity 2); deadline 2026-10-13 |
+| `sms_real_phone`, `sms_no_real_phone` | Step 3: `IsNot true` split, `SMSSYNC` send, `defaults.mobileNumber` copied by the entry query from `Master.Phone` | 1 / 2 / 6; one contact with the real number in both columns; without it, report says the SMS cannot be checked |
 
 `engagement_no_inbox` and `engagement_sent` share the same package (built by the same function), as do
-`case_mismatch` and `case_mismatch_insensitive`; only `settings` in `expected.json` differ.
+`case_mismatch` and `case_mismatch_insensitive`, and `sms_real_phone` and `sms_no_real_phone`; only `settings` in
+`expected.json` differ.
+
+In the step 3 examples every date is relative to the generation time the tests fix, T0 = 2026-10-11 12:00
+(`NOW` in `tests/test_examples.py`); the entry time and the minimum validity of the data keep their defaults.
 
 ## Conventions used in the expected answers
 
@@ -99,6 +110,15 @@ yet can ignore them, but they are part of the expected answer.
 | `contact_count: {min, max}` | pilots | a range, like `scenario_count` and `case_count` |
 | `branches_any_of` | pilots | `{branch: [allowed statuses]}` for the three branches whose status depends on the generator's cover; together with `branches` it lists every split outcome |
 | `cases[i].contact_constraints`, `cases[i].has_row`, `report_contains`, `report_not_contains`, `report_head_contains`, `testbook_contains`, `warnings_not_contain`, `csv_no_space_cells`, lists of alternatives | extension examples | see `docs/plan.md`, section "Esempi" |
+| `cases[i].timeline` | step 3 time examples | `{activity_key: "YYYY-MM-DD HH:MM"}`: the clock of `Case.timeline` (`TimelinePoint.at`, default date format) at each listed activity of the path; for a wait, the moment it ends; unlisted activities are not compared |
+| `cases[i].validity_days` | step 3 time examples | equals `Case.validity_days` (`null` = nothing in the case depends on the clock); omitted where the case's values are not perishable (no slip up to a year changes them) |
+| `validity_days` | step 3 time examples | equals `CoverageResult.validity_days` (`null` = no activation deadline) |
+| `cases[i].exit_by_criteria` | step 3 time examples | equals `Case.exit_by_criteria`: the wait at whose end the exit criteria take the contact out, `null` otherwise |
+| `exit_targets` | step 3 exit examples | `{"<criterion key>/met": {"status", "reason_contains"}}` against `CoverageResult.exit_targets` (`activity_key` = the criterion's key, `outcome_key` = `met`); lists every exit criterion of the journey |
+| `cases[i].sms_sent` | step 3 SMS examples | equals `Case.sms_sent` |
+| `cases[i].contact_values_any_of` | none at present | `{"Table.Field": [values]}`: the case value is one of these (a tie the spec does not break) |
+| `cases[i].contact_rows` | step 3 SMS examples | one `{"Table.Field": value}` per contact of the case, matched in contact-key order (as `tests/test_examples.py` reads it) against the CSV rows of the case's contacts (a contact's row: the row of that table with a cell holding the contact key) |
+| `csv_values` | step 3 examples | `{"Table.Field": [values]}`: the set of distinct values of that column over the table's CSV (as in `link_table_path`) |
 
 ## What expected.json cannot express yet
 
@@ -121,6 +141,7 @@ yet can ignore them, but they are part of the expected answer.
 python examples/build_examples.py
 python examples/build_fresh_examples.py
 python examples/build_extension_examples.py
+python examples/build_step3_time_examples.py
 ```
 
 rewrites every `package.json` and checks, for every example: valid JSON, one selected journey, every

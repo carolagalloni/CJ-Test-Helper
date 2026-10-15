@@ -43,7 +43,7 @@ import sys
 import traceback
 from collections import Counter
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Optional
@@ -65,6 +65,7 @@ from cjhelper.model import (  # noqa: E402
     KIND_EMAIL,
     KIND_ENGAGEMENT,
     KIND_RANDOM,
+    KIND_SMS,
     KIND_UNSUPPORTED,
     KIND_UPDATE,
     KIND_WAIT_ATTRIBUTE,
@@ -138,6 +139,7 @@ ACTIVITY_NAMES: dict[str, str] = {
     KIND_WAIT_ATTRIBUTE: "Wait by attribute",
     KIND_WAIT_STO: "Send-time wait",
     KIND_EMAIL: "Email",
+    KIND_SMS: "SMS",
     KIND_UPDATE: "Update contact",
     KIND_UNSUPPORTED: "Non supportata",
 }
@@ -164,9 +166,10 @@ SETTING_LABELS: dict[str, str] = {
     "activation_field": "Campo di attivazione",
     "run_id": "Run identifier nelle chiavi",
     "case_insensitive_text": "I confronti di testo ignorano maiuscole e minuscole",
+    "min_validity_days": "Validità minima dei dati (giorni)",
 }
 NUMBER_SETTINGS = ("contacts_per_case", "contacts_per_random_case", "window_start_days", "window_end_days",
-                   "wait_offset_hours", "wait_offset_before_engagement_hours")
+                   "wait_offset_hours", "wait_offset_before_engagement_hours", "min_validity_days")
 TEXT_SETTINGS = ("real_inbox", "real_phone", "fake_phone", "run_id")
 
 # Visible notes under a field (spec wording where it has some).
@@ -175,8 +178,8 @@ SETTING_NOTES: dict[str, str] = {
                    "Se resta vuota, ricevono indirizzi non recapitabili e i branch relativi risultano non coperti."),
     "run_id": ("Viene aggiunto a ogni chiave, per esempio TST_R01_C0001. Usane uno nuovo a ogni generazione, così "
                "le evidenze di due run non si mescolano."),
-    "real_phone": ("Non viene usato: nessuno dei tipi di attività supportati dal generatore invia messaggi a un "
-                   "telefono."),
+    "real_phone": ("Lo riceve un contatto per ogni caso il cui percorso invia un SMS, così il tester può controllarlo. "
+                   "Se resta vuoto, l'SMS non può essere verificato."),
 }
 SETTING_HELP: dict[str, str] = {
     "fake_phone": "Il numero palesemente fittizio scritto per ogni contatto.",
@@ -188,6 +191,8 @@ SETTING_HELP: dict[str, str] = {
                          "volta, nei CSV è attivo solo il primo scenario."),
     "case_insensitive_text": ("Resta da verificare se Salesforce tratta Email ed EMAIL come lo stesso valore; con "
                               "l'opzione disattivata sono valori diversi."),
+    "min_validity_days": ("I valori scelti rispetto all'ora di ingresso restano validi almeno questi giorni, dove le "
+                          "classi di valori lo permettono. Con 0 i dati vanno attivati lo stesso giorno."),
 }
 DEFAULT_DATE_PATTERN = "YYYY-MM-DD HH:MM"     # how the spec writes the default date format
 
@@ -216,6 +221,7 @@ class TableLine:
     role: str              # report.md's role names, e.g. "source, split", "written", "nessuno"
     level: str             # "contact", "scenario", or "-" for a table without a CSV
     csv: bool              # gets a CSV
+    managed: bool = False  # a synchronized (managed) data extension: shown as such, its CSV is imported as usual
 
 
 @dataclass
@@ -231,6 +237,7 @@ class DetectionSummary:
     activation_field: Optional[FieldRef]   # suggested from the entry query filters, or None
     activation_choices: list[FieldRef]     # Boolean fields of the scenario-level tables
     entry_kind: str = ENTRY_AUTOMATION     # EntryEvent.kind: with Run Once, one active scenario is not offered
+    exits: list[str] = field(default_factory=list)   # the exit criteria, one line each (step 3, "Exit criteria")
 
 
 def activity_counts(journey: Journey) -> list[tuple[str, int]]:
@@ -243,13 +250,22 @@ def activity_counts(journey: Journey) -> list[tuple[str, int]]:
 
 def role_text(roles: Iterable[str]) -> str:
     """The roles of a table as report.md writes them, e.g. ``{"split", "source"}`` -> "source, split"."""
-    return ", ".join(sorted(roles)) or "nessuno"
+    return outputs.role_text(roles)
 
 
-def table_lines(table_model: TableModel) -> list[TableLine]:
+def exit_lines(package: Package) -> list[str]:
+    """Spec, step 3, "Exit criteria and goals": each exit criterion of the journey with whether the generator
+    evaluates it, as report.md's Criteri di uscita section says."""
+    return [f"{outputs.exit_description(e)}: {outputs.exit_evaluation_text(e)}"
+            for e in getattr(package.journey, "exits", None) or []]
+
+
+def table_lines(table_model: TableModel, managed: Iterable[str] = ()) -> list[TableLine]:
     """Spec, step 2: "the tables with their role"; the tables that get a CSV come first."""
+    managed = set(managed)
     lines = [TableLine(name=role.name, role=role_text(role.roles),
-                       level=(role.level or "-") if role.selected else "-", csv=role.selected)
+                       level=(role.level or "-") if role.selected else "-", csv=role.selected,
+                       managed=role.name in managed)
              for role in table_model.tables.values()]
     return [line for line in lines if line.csv] + [line for line in lines if not line.csv]
 
@@ -298,13 +314,14 @@ def summarize_detection(package: Package, table_model: TableModel) -> DetectionS
         journey_name=package.journey.name,
         activity_count=package.journey.activity_count,
         activities=activity_counts(package.journey),
-        tables=table_lines(table_model),
+        tables=table_lines(table_model, [t.name for t in package.tables.values() if getattr(t, "managed", False)]),
         csv_files=[outputs.table_file_name(name) for name in table_model.selected_tables],
         warnings=lines,
         ids_left_out=left_out,
         activation_field=table_model.activation_field,
         activation_choices=activation_choices(package, table_model),
         entry_kind=outputs.entry_kind(package),
+        exits=exit_lines(package),
     )
 
 
@@ -679,6 +696,9 @@ def render_result(result: GenerationResult, zip_bytes: bytes) -> None:
     if warning:   # spec, "Honest outcomes": the page opens with this warning
         st.warning(_md(f"{warning} {outputs.REPORT_FILE} spiega il motivo nelle sezioni Branch non coperti ed "
                        "Elementi non supportati."))
+    deadline = outputs.activation_deadline_text(result)
+    if deadline:   # spec, step 3, "Honest checks": the deadline for importing and activating, when the data is perishable
+        st.warning(_md(deadline))
     chip, sentence, ok = checks_banner(result)
     st.markdown(f'<div class="cj-banner{"" if ok else " failed"}"><span class="cj-chip">{_html(chip)}</span>'
                 f'<span>{_html(sentence)}</span></div>', unsafe_allow_html=True)
@@ -818,13 +838,17 @@ def _show_detection(summary: DetectionSummary) -> None:
         _label("Tabelle con CSV")
         with_csv = [line for line in summary.tables if line.csv]
         if with_csv:
-            rows = [(line.name, line.role, _level_text(line.level)) for line in with_csv]
+            rows = [(line.name + (" (sincronizzata dal CRM)" if line.managed else ""), line.role,
+                     _level_text(line.level)) for line in with_csv]
             st.markdown(_markdown_table(["Tabella", "Ruolo", "Livello"], rows))
         else:
             st.markdown("Nessuna tabella ha un CSV.")
         without = [f"{line.name} ({line.role})" for line in summary.tables if not line.csv]
         if without:
             st.caption(_md(f"Senza CSV: {_join_words(without)}."))
+    if summary.exits:
+        _label("Criteri di uscita")
+        _show_list(summary.exits, empty="")
     if summary.warnings:
         with st.expander(f"Warning trovati nell'export ({len(summary.warnings)})"):
             _show_list(summary.warnings, empty="")
@@ -880,6 +904,9 @@ def _settings_form(summary: DetectionSummary, running: bool) -> tuple[Settings, 
             with right:
                 values["wait_offset_before_engagement_hours"] = _number("wait_offset_before_engagement_hours",
                                                                         defaults)
+            left, right = st.columns(2, vertical_alignment="bottom")
+            with left:
+                values["min_validity_days"] = _number("min_validity_days", defaults, min_value=0)
             values["date_format"] = _text("date_format", defaults)
             st.caption(_md(date_format_note(datetime.now())))
             _label("Scenari")

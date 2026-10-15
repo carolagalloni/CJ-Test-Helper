@@ -281,6 +281,17 @@ def test_detection_step_on_pilot_shows_journey_activities_and_the_four_csv_table
     assert not at.get("download_button")      # nothing generated yet
 
 
+def test_detection_step_lists_the_exit_criteria():
+    """Spec, step 3, "Exit criteria and goals": the review step names the exit criteria and whether they are modelled."""
+    data = (ROOT / "examples" / "exit_criteria_at_wait_end" / "package.json").read_bytes()
+    line = "Status not equal Active OR IsDunning is True: valutato alla fine di ogni wait"
+    assert app.load_summary(data).exits == [line]
+    at = AppTest.from_function(_render_page, args=(data,)).run(timeout=TIMEOUT)
+    assert not at.exception and "Criteri di uscita" in _labels(at)
+    assert f"- {line}" in _markdown(at)
+    assert app.role_text({"link", "source"}) == "collegamento, source"
+
+
 def test_activity_counts_and_roles_use_plain_names():
     activities = {key: SimpleNamespace(kind=kind) for key, kind in
                   [("a", "decision"), ("b", "unsupported"), ("c", "decision"), ("d", "wait_sto"), ("e", "new_kind")]}
@@ -363,6 +374,14 @@ def test_settings_mapping_with_a_run_once_entry_does_not_offer_one_active_scenar
     assert settings.one_active_scenario is False and settings.activation_field is None
 
 
+def test_settings_map_the_minimum_validity_of_the_data():
+    """Spec, step 3, "Validity of the data": the setting "minimum validity of the data" (default 1 day)."""
+    assert app.SETTING_LABELS["min_validity_days"] == "Validità minima dei dati (giorni)"
+    assert app.settings_from_form(app.default_form_values(PILOT_ACTIVATION)).min_validity_days == 1
+    settings = app.settings_from_form({**app.default_form_values(PILOT_ACTIVATION), "min_validity_days": 0.0})
+    assert settings.min_validity_days == 0 and isinstance(settings.min_validity_days, int)
+
+
 @needs_pilot
 def test_settings_with_a_run_once_entry_disable_one_active_scenario(pilot_bytes, monkeypatch):
     monkeypatch.setattr("cjhelper.outputs.entry_kind", lambda package: ENTRY_RUN_ONCE)
@@ -392,7 +411,8 @@ def test_settings_start_at_the_spec_defaults_with_inbox_and_run_identifier_first
     assert more.proto.expanded is False
     numbers = {name: _widget(at.number_input, labels[name]).value for name in app.NUMBER_SETTINGS}
     assert numbers == {"contacts_per_case": 3, "contacts_per_random_case": 50, "window_start_days": -1,
-                       "window_end_days": 7, "wait_offset_hours": 0, "wait_offset_before_engagement_hours": 24}
+                       "window_end_days": 7, "wait_offset_hours": 0, "wait_offset_before_engagement_hours": 24,
+                       "min_validity_days": 1}
     assert {w.label for w in more.number_input} == {labels[name] for name in app.NUMBER_SETTINGS}
     texts = {name: _widget(at.text_input, labels[name]).value
              for name in ("real_inbox", "real_phone", "fake_phone", "date_format", "run_id")}
@@ -542,6 +562,18 @@ def test_result_step_shows_summary_import_previews_download_checks_and_warnings(
     assert "report.md elenca le attività coinvolte." in captions
     buttons = at.get("download_button")
     assert len(buttons) == 1 and buttons[0].label == app.DOWNLOAD_LABEL and buttons[0].proto.type == "primary"
+
+
+def test_result_step_shows_the_activation_deadline_when_the_data_is_perishable():
+    """Spec, step 3, "Honest checks": the page, like report.md, gives the deadline for importing and activating."""
+    result = _stub_result()
+    result.coverage.validity_days = 2
+    result.settings.entry_time = datetime(2026, 10, 11, 12, 0)
+    at = AppTest.from_function(_result_page, args=(result, b"zip bytes")).run(timeout=TIMEOUT)
+    assert not at.exception
+    assert [_plain(w.value) for w in at.warning] == [
+        "Importa i file e attiva il journey entro 2026-10-13 12:00: i valori scelti rispetto all'ora di ingresso "
+        "restano validi 2 giorni."]
 
 
 def test_result_step_opens_with_the_warning_on_unsupported_elements():

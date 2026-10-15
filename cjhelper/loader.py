@@ -42,10 +42,28 @@ Rules of the spec section "Extensions beyond the pilot (agreed 12 October 2026)"
 - Entry source: the event definition's type and ``metaData.scheduleFlowMode`` give
   ``EntryEvent.kind`` (``ENTRY_SOURCE_TYPES`` and ``SCHEDULE_FLOW_MODES``, one lookup table each). An
   ``automationId`` is a feeding automation only for an automation entry: on a data extension entry it
-  is the scheduler Journey Builder creates (assumption). Entry filters, goals and exit criteria are not
-  modelled: when present they are reported. ``entryMode`` is kept on the journey.
-- Warnings about assets and landing pages that no Email activity of the journey sends are dropped.
+  is the scheduler Journey Builder creates (assumption). Entry filters and goals are not modelled: when
+  present they are reported (exit criteria: see step 3 below). ``entryMode`` is kept on the journey.
+- Warnings about assets and landing pages that no Email (or SMS) activity of the journey sends are dropped.
 - A journey default (email, mobile number) naming a column the entry table lacks is reported.
+
+Rules of the spec section "Extensions for time-dependent journeys (step 3, 14 October 2026)" applied here:
+
+- SMS sends: ``SMSSYNC`` is ``KIND_SMS`` (no branching); the journey's default mobile number
+  (``defaults.mobileNumber``) is read as the default email is.
+- The clock: a wait by attribute keeps its offset (``waitDuration`` and ``waitUnit``, possibly negative)
+  and its time of day (``specifiedTime``); a WAIT without ``metaData.uiType`` is told apart by its date
+  expression or its key.
+- Tables reached through other tables: the path from the contact to the table a condition or a wait by
+  attribute reads (the relationship ids of the condition, the segments of the wait's expression) is kept
+  as table names, nearest the contact first (``Condition.path``, ``Activity.wait_path``).
+- Relative dates: a relative value on a field that is not a Date, in a unit criteria.py does not list or
+  with an operator that does not take one (``criteria.RELATIVE_OPERATORS``) is unsupported.
+- Exit criteria and goals are parsed like decision split criteria (``Journey.exits``, ``Journey.goals``);
+  the exit criteria the generator can evaluate are reported as evaluated at the end of every wait, the
+  others and the goals as not modelled.
+- Synchronized data extensions: a table Package Manager marks NO_DEPLOY / ManagedDataExtension is
+  ``Table.managed`` and reported.
 
 Everything odd met while reading, and every reading the spec does not fix, goes to
 ``Package.warnings`` in plain words. Nothing here knows the pilot: every name is read
@@ -59,8 +77,9 @@ import json
 import re
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Callable, Iterator, Optional
+from typing import Any, Callable, Iterator, NamedTuple, Optional
 
+from . import criteria as criteria_rules
 from .criteria import OPERATORS, CriteriaError, between_bounds, parse_criteria, split_attribute
 from .model import (
     ACTIVITY_KINDS,
@@ -73,6 +92,7 @@ from .model import (
     KIND_EMAIL,
     KIND_ENGAGEMENT,
     KIND_RANDOM,
+    KIND_SMS,
     KIND_UNSUPPORTED,
     KIND_UPDATE,
     KIND_WAIT_ATTRIBUTE,
@@ -88,6 +108,7 @@ from .model import (
     Field,
     Formula,
     Journey,
+    JourneyFilter,
     Outcome,
     Package,
     Query,
@@ -96,6 +117,7 @@ from .model import (
     Value,
     Write,
     formula_conditions,
+    formula_text,
 )
 
 
@@ -114,6 +136,10 @@ WAIT_UI_TYPES: dict[str, str] = {
     "WAITBYDURATION": KIND_WAIT_DURATION,
     "WAITBYATTRIBUTE": KIND_WAIT_ATTRIBUTE,
 }
+
+# Spec, step 3, "The clock": the units a wait by attribute's offset (waitUnit) can be written in. Any other unit
+# is kept as written and reported: the end of that wait cannot be computed.
+WAIT_UNITS = frozenset({"MINUTES", "HOURS", "DAYS", "WEEKS", "MONTHS", "YEARS"})
 
 QUERY_OBJECT_TYPE = 300     # automation step activity that runs a query (1000 = data verification)
 
@@ -140,6 +166,17 @@ CONTENT_KINDS = frozenset({"assets", "landingPages", "primaryLandingPages", "clo
 
 # Package Manager issue levels kept as warnings (spec: "Package Manager issues of level warning or error").
 ISSUE_LEVELS = ("WARNING", "ERROR")
+
+# Spec, step 3, "Synchronized data extensions": the Package Manager issue fields, and their values, that mark a
+# managed data extension (functionality NO_DEPLOY, objectType ManagedDataExtension); the entity kinds that hold tables.
+MANAGED_MARKS: dict[str, frozenset[str]] = {
+    "functionality": frozenset({"NO_DEPLOY"}),
+    "objectType": frozenset({"ManagedDataExtension"}),
+}
+TABLE_KINDS = ("dataExtensions", "sharedDataExtensions")
+
+# Spec, step 3, "Exit criteria and goals": the reason given for an exit criterion or a goal without criteria.
+NO_CRITERIA = "nessun criterio"
 
 REFERENCE = re.compile(r"\{\{mcpm#/entities/([^/{}]+)/([^/{}]+)/data/([^{}]*)\}\}")
 FIELD_ID_PATH = re.compile(r"^fields/name:(.+)/id$")
@@ -180,7 +217,8 @@ def load_package(source: Any) -> Package:
                           for entity_id, entity in group.items()}
     for text in _package_issues(export, entities, journey_id, sent, _indirect_content(entities, journey_id, sent)):
         _warn(warnings, text)
-    return _ExportReader(resolved, warnings).read_package(str(export.get("name") or ""), journey_id)
+    reader = _ExportReader(resolved, warnings, _list(export.get("issues")))
+    return reader.read_package(str(export.get("name") or ""), journey_id)
 
 
 def resolve_references(value: Any, entities: dict, warnings: Optional[list[str]] = None) -> Any:
@@ -336,20 +374,19 @@ def _reference_value(match: re.Match, entities: dict, sink: WarningSink) -> str:
 
 
 def _sent_assets(entities: dict, journey_data: dict) -> set[str]:
-    """Ids and legacy ids of the assets the journey's Email activities send, read from the raw journey.
+    """Ids and legacy ids of the assets the journey's Email and SMS activities send, read from the raw journey.
 
-    ``triggeredSend.emailId`` is a reference to the asset (its id is in the reference) or a plain id,
-    which may be the asset's legacy id. Both spellings of each sent asset are in the set.
+    ``triggeredSend.emailId`` (email) and ``configurationArguments.assetId`` (SMS) are a reference to the
+    asset (its id is in the reference) or a plain id, which may be the asset's legacy id. Both spellings of
+    each sent asset are in the set.
     """
     sent: set[str] = set()
     for raw in _list(journey_data.get("activities")):
-        if not isinstance(raw, dict) or ACTIVITY_KINDS.get(str(raw.get("type") or "")) != KIND_EMAIL:
+        asset_ref = _sent_asset_ref(raw)
+        if asset_ref is None:
             continue
-        email_ref = _dict(_dict(raw.get("configurationArguments")).get("triggeredSend")).get("emailId")
-        if email_ref is None:
-            continue
-        found = [m.group(2) for m in REFERENCE.finditer(str(email_ref)) if m.group(1) == "assets"]
-        sent.update(found or [str(email_ref)])
+        found = [m.group(2) for m in REFERENCE.finditer(str(asset_ref)) if m.group(1) == "assets"]
+        sent.update(found or [str(asset_ref)])
     for asset_id, data in _entity_items(entities, "assets"):
         legacy_id = _value_at(data, "data/email/legacy/legacyId")
         if legacy_id is None:
@@ -361,8 +398,21 @@ def _sent_assets(entities: dict, journey_data: dict) -> set[str]:
     return sent
 
 
+def _sent_asset_ref(raw: Any) -> Any:
+    """The asset an Email or SMS activity of the raw journey sends, as written; None for any other activity."""
+    if not isinstance(raw, dict):
+        return None
+    kind = ACTIVITY_KINDS.get(str(raw.get("type") or ""))
+    config = _dict(raw.get("configurationArguments"))
+    if kind == KIND_EMAIL:
+        return _dict(config.get("triggeredSend")).get("emailId")
+    if kind == KIND_SMS:
+        return config.get("assetId")
+    return None
+
+
 def _unused_content(kind: Optional[str], entity_id: Any, sent: set[str]) -> bool:
-    """An asset or landing page that no Email activity of the journey sends."""
+    """An asset or landing page that no Email or SMS activity of the journey sends."""
     return kind in CONTENT_KINDS and str(entity_id) not in sent
 
 
@@ -452,6 +502,8 @@ def _package_issues(export: dict, entities: dict, journey_id: str, sent: set[str
     for kind, entity_id, issue in found:
         if not isinstance(issue, dict):
             continue
+        if (kind in TABLE_KINDS or (kind is None and _about_table(issue))) and _managed_marks(issue):
+            continue    # a managed data extension: reported once by _ExportReader.read_managed
         indirectly_used = _unused_content(kind, entity_id, sent)
         if indirectly_used and str(entity_id) not in indirect:
             continue
@@ -460,7 +512,7 @@ def _package_issues(export: dict, entities: dict, journey_id: str, sent: set[str
             continue
         missing = _dict(issue.get("entity"))
         location = _dict(missing.get("locationInformation"))
-        sent_by_journey = ACTIVITY_KINDS.get(str(location.get("activityType") or "")) == KIND_EMAIL
+        sent_by_journey = ACTIVITY_KINDS.get(str(location.get("activityType") or "")) in (KIND_EMAIL, KIND_SMS)
         if _unused_content(missing.get("entityType"), missing.get("value"), sent) and not sent_by_journey:
             if kind not in CONTENT_KINDS:
                 continue
@@ -471,6 +523,17 @@ def _package_issues(export: dict, entities: dict, journey_id: str, sent: set[str
         texts.append(f"Package Manager segnala {level} {_issue_host(entities, kind, entity_id)}: "
                      f"{_issue_description(issue)}.")
     return texts
+
+
+def _managed_marks(issue: Any) -> list[str]:
+    """The values of a Package Manager issue that mark a managed data extension (MANAGED_MARKS), as written."""
+    issue = _dict(issue)
+    return [str(issue.get(name)) for name, values in MANAGED_MARKS.items() if str(issue.get(name) or "") in values]
+
+
+def _about_table(issue: Any) -> bool:
+    """An export-level issue whose entity is a data extension."""
+    return _dict(_dict(issue).get("entity")).get("entityType") in TABLE_KINDS
 
 
 def _issue_host(entities: dict, kind: Optional[str], entity_id: str) -> str:
@@ -497,8 +560,9 @@ def _issue_description(issue: dict) -> str:
             text += f", usato dall'attività '{location['activityName']}' ({location.get('activityType')})"
     elif issue_type == "UNSUPPORTED_FUNCTIONALITY":
         text = f"funzionalità non supportata {issue.get('functionality')}"
-        if issue.get("blockType"):
-            text += f" ({issue['blockType']})"
+        details = [str(issue[name]) for name in ("blockType", "objectType") if issue.get(name)]
+        if details:
+            text += f" ({', '.join(details)})"
     else:
         text = " ".join(str(part) for part in (issue_type, issue.get("issue"), issue.get("functionality")) if part)
     message = _dict(issue.get("cause")).get("message") or issue.get("message")
@@ -654,6 +718,21 @@ def _event_key(expression: Any) -> Optional[str]:
     return None
 
 
+def _path_tables(tables: list[Optional[str]], own_table: str) -> tuple[str, ...]:
+    """The tables of a path from the contact, nearest the contact first, without repeats, without empty names and
+    without the table the path leads to (spec, step 3, "Tables reached through other tables")."""
+    path: list[str] = []
+    for table in tables:
+        if table and table != own_table and table not in path:
+            path.append(table)
+    return tuple(path)
+
+
+def _one_line(text: str) -> str:
+    """A text on one line with single spaces (criteria descriptions hold double spaces)."""
+    return " ".join(text.split())
+
+
 def _named(activity: Activity) -> str:
     """An activity as named in warnings: its key, and its name when it has one."""
     return f"{activity.key} ({activity.name})" if activity.name else activity.key
@@ -677,12 +756,21 @@ def _outcome(raw: dict) -> Outcome:
 # Building the package
 # ---------------------------------------------------------------------------
 
+class _Link(NamedTuple):
+    """One attributeRelationships entity, as the path of a condition reads it: a group-to-set link (the contact
+    model pointing at ``right_table``) or a link from ``left_table`` to ``right_table``."""
+    group_to_set: bool
+    left_table: Optional[str]
+    right_table: str
+
+
 class _ExportReader:
     """Builds the Package from the resolved ``entities`` of one export, collecting warnings."""
 
-    def __init__(self, entities: dict, warnings: list[str]):
+    def __init__(self, entities: dict, warnings: list[str], top_issues: Optional[list] = None):
         self.entities = entities
         self.warnings = warnings
+        self.top_issues = [issue for issue in top_issues or [] if isinstance(issue, dict)]   # export-level issues
         self.tables: dict[str, Table] = {}
         self.table_aliases: dict[str, str] = {}     # entity id or customer key -> table name
         self.set_tables: dict[str, str] = {}        # attribute set id or name -> table name
@@ -691,6 +779,7 @@ class _ExportReader:
         self.emails: dict[str, EmailAsset] = {}
         self.legacy_email_ids: dict[str, str] = {}  # email legacyId -> asset id
         self.relationships: list[Relationship] = []
+        self.relationship_links: dict[str, _Link] = {}   # attributeRelationships entity id -> its tables
         self.related_tables: set[str] = set()       # tables named by a relationship of the export
         self.missing_relationships: list[str] = []  # tables read through a set that no relationship names
         self.entry: Optional[EntryEvent] = None
@@ -773,9 +862,10 @@ class _ExportReader:
 
     def read_tables(self) -> None:
         """Plan: "Tables: all dataExtensions (and sharedDataExtensions), fields in ordinal order"."""
-        for kind in ("dataExtensions", "sharedDataExtensions"):
+        for kind in TABLE_KINDS:
             for entity_id, data in self.items(kind):
                 table = self.table_from(entity_id, data)
+                self.read_managed(kind, entity_id, table)
                 if table.name in self.tables:
                     self.warn(f"Due tabelle si chiamano {table.name}: si usa la prima dell'export.")
                 else:
@@ -800,6 +890,27 @@ class _ExportReader:
         if sendable_field:
             table.sendable_field = self.field_spelling(table, str(sendable_field))
         return table
+
+    def read_managed(self, kind: str, entity_id: str, table: Table) -> None:
+        """Spec, step 3, "Synchronized data extensions": a source table that Package Manager marks as a managed
+        data extension (NO_DEPLOY, ManagedDataExtension ...) is imported like every other CSV; its rows also arrive
+        from the CRM sync.
+
+        The marks are read in the issues of the table's entity and in the export-level issues that name the
+        table (by id, name or customer key). A marked table is ``managed``, with one warning, which also stands
+        for the Package Manager issue that marks it (``_package_issues`` leaves that issue out).
+        """
+        names = {entity_id, table.name, table.customer_key}
+        issues = _list(_dict(_dict(self.entities.get(kind)).get(entity_id)).get("issues")) + [
+            issue for issue in self.top_issues
+            if _about_table(issue) and str(_dict(issue.get("entity")).get("value")) in names]
+        marks = [mark for issue in issues for mark in _managed_marks(issue)]
+        if not marks:
+            return
+        table.managed = True
+        self.warn(f"La data extension {table.name} è sincronizzata (managed data extension; Package Manager la "
+                  f"segnala come {', '.join(dict.fromkeys(marks))}): le sue righe arrivano anche dalla "
+                  "sincronizzazione.")
 
     def field_from(self, table_name: str, raw: dict, position: int) -> Field:
         name = str(raw["name"])
@@ -904,6 +1015,7 @@ class _ExportReader:
             left_table = None if group_to_set else self.item_table(left_item, name)
             right_table = self.item_table(right_item, name)
             self.related_tables.update(table for table in (left_table, right_table) if table)
+            self.relationship_links[relationship_id] = _Link(group_to_set, left_table, right_table)
             pairs = [pair for pair in _list(data.get("relationshipAttributes")) if isinstance(pair, dict)]
             if not pairs:
                 self.warn(f"La relazione {name} non indica alcun campo, quindi non collega nulla.")
@@ -1133,13 +1245,13 @@ class _ExportReader:
         defaults = _dict(data.get("defaults"))
         self.check_defaults(defaults, entry)
         email_defaults = _list(defaults.get("email"))
-        goals, exits = _list(data.get("goals")), _list(data.get("exits"))
+        mobile_defaults = _list(defaults.get("mobileNumber"))
+        goals = self.read_filters(_list(data.get("goals")), "goal")
+        exits = self.read_filters(_list(data.get("exits")), "exit")
         if goals:
             self.warn(f"Il journey ha {len(goals)} goal: il generatore non li modella, quindi i contatti che "
                       "raggiungono un goal potrebbero uscire prima della fine del percorso previsto.")
-        if exits:
-            self.warn(f"Il journey ha {len(exits)} criteri di uscita (exit criteria): il generatore non li modella, "
-                      "quindi alcuni contatti potrebbero uscire prima della fine del percorso previsto.")
+        self.report_exits(exits)
         return Journey(
             name=str(data.get("name") or journey_id),
             key=str(data.get("key") or ""),
@@ -1153,7 +1265,63 @@ class _ExportReader:
             entry_mode=_text_or_none(data.get("entryMode")) or None,
             goal_count=len(goals),
             exit_count=len(exits),
+            exits=exits,
+            goals=goals,
+            default_mobile_field=_event_field(mobile_defaults[0]) if mobile_defaults else None,
         )
+
+    # -- exit criteria and goals --------------------------------------------------
+
+    def read_filters(self, raw_filters: list, kind: str) -> list[JourneyFilter]:
+        """Spec, step 3, "Exit criteria and goals": every exit criterion (``kind`` "exit") or goal ("goal") of the
+        journey, in export order. See ``read_filter``."""
+        return [self.read_filter(raw, kind) for raw in raw_filters if isinstance(raw, dict)]
+
+    def read_filter(self, raw: dict, kind: str) -> JourneyFilter:
+        """One exit criterion or goal. Its criteria (``configurationArguments.criteria``) are read and mapped
+        like a decision split's ("the same operators, data sources and relative dates as a decision split"),
+        and ``unsupported_reason`` says why the generator cannot evaluate them: no criteria ("nessun criterio"),
+        criteria that cannot be read, or a condition the rules of ``unsupported_formula`` reject."""
+        key = str(raw.get("key") or raw.get("id") or "")
+        found = JourneyFilter(
+            key=key,
+            name=str(raw.get("name") or key),
+            kind=kind,
+            formula=None,
+            description=str(_dict(raw.get("metaData")).get("criteriaDescription") or ""),
+        )
+        xml = _dict(raw.get("configurationArguments")).get("criteria")
+        if not isinstance(xml, str) or not xml.strip():
+            found.unsupported_reason = NO_CRITERIA
+            return found
+        try:
+            formula = parse_criteria(xml)
+        except CriteriaError as error:
+            found.unsupported_reason = f"i criteri non si possono leggere ({error})"
+            return found
+        found.formula = self.map_formula(formula)
+        found.unsupported_reason = self.unsupported_formula(found.formula, "il criterio" if kind == "exit"
+                                                            else "il goal")
+        return found
+
+    def report_exits(self, exits: list[JourneyFilter]) -> None:
+        """Spec, step 3: "Journey Builder evaluates the exit criteria of a journey for each contact when the
+        contact's time in a wait activity expires (documented)" and "Exit criteria with a condition the
+        generator cannot evaluate are reported as not modelled". The exit criteria the generator evaluates are
+        reported once, with their description; each of the others gets its own warning, with the reason."""
+        modelled = [exit_ for exit_ in exits if exit_.unsupported_reason is None]
+        if modelled:
+            one = len(modelled) == 1
+            quoted = "; ".join(f'"{_one_line(exit_.description) or formula_text(exit_.formula)}"' for exit_ in modelled)
+            self.warn(f"Il journey ha {len(modelled)} {'criterio' if one else 'criteri'} di uscita (exit criteria) "
+                      f"che il generatore valuta alla fine di ogni wait, come Journey Builder: il contatto che "
+                      f"{'lo' if one else 'ne'} soddisfa {'' if one else 'uno '}esce dal journey in quel punto. "
+                      f"{'Criterio' if one else 'Criteri'}: {quoted}.")
+        for exit_ in exits:
+            if exit_.unsupported_reason is not None:
+                self.warn(f"Il criterio di uscita (exit criteria) {exit_.name!r} non è modellato: "
+                          f"{exit_.unsupported_reason}. Alcuni contatti potrebbero uscire dal journey alla fine di un "
+                          "wait, prima della fine del percorso previsto.")
 
     def start_key(self, activities: dict[str, Activity]) -> Optional[str]:
         """Spec: "The start is the activity no other activity points to." Several -> the first, with a warning."""
@@ -1208,21 +1376,42 @@ class _ExportReader:
             self.read_email(activity, raw)
         elif activity.kind == KIND_UPDATE:
             self.read_update(activity, raw)
+        elif activity.kind == KIND_SMS:
+            self.read_sms(activity, raw)
         return activity
 
     def activity_kind(self, activity: Activity, raw: dict) -> str:
         """Plan: map ``type`` through ``model.ACTIVITY_KINDS``; unknown types are unsupported.
 
-        A WAIT is refined by ``metaData.uiType`` through WAIT_UI_TYPES.
+        A WAIT is refined by ``wait_kind``.
         """
-        kind = ACTIVITY_KINDS.get(activity.raw_type, KIND_UNSUPPORTED)
         if activity.raw_type == "WAIT":
-            ui_type = _dict(raw.get("metaData")).get("uiType")
+            return self.wait_kind(activity, raw)
+        return ACTIVITY_KINDS.get(activity.raw_type, KIND_UNSUPPORTED)
+
+    def wait_kind(self, activity: Activity, raw: dict) -> str:
+        """A WAIT is refined by ``metaData.uiType`` through WAIT_UI_TYPES; a uiType not listed is unsupported.
+
+        Without a uiType the wait is told apart by what it holds: a non-empty
+        ``waitEndDateAttributeExpression`` is a wait by attribute, else the key prefix (``WAITBYATTRIBUTE-1``,
+        ``WAITBYDURATION-8``) names the kind. A wait nothing identifies is unsupported, with a warning.
+        """
+        ui_type = _dict(raw.get("metaData")).get("uiType")
+        if ui_type:
             kind = WAIT_UI_TYPES.get(str(ui_type), KIND_UNSUPPORTED)
             if kind == KIND_UNSUPPORTED:
                 self.warn(f"Attività {_named(activity)}: è un wait di tipo {ui_type!r}; sono supportati solo "
                           f"Wait by duration e Wait by attribute, quindi è segnalata come non supportata.")
-        return kind
+            return kind
+        expression = _dict(raw.get("configurationArguments")).get("waitEndDateAttributeExpression")
+        if isinstance(expression, str) and expression.strip():
+            return KIND_WAIT_ATTRIBUTE
+        for prefix, kind in WAIT_UI_TYPES.items():
+            if activity.key.upper().startswith(prefix):
+                return kind
+        self.warn(f"Attività {_named(activity)}: è un wait che non indica il suo tipo (metaData.uiType), non attende "
+                  "un attributo data e non ha una chiave che lo identifichi, quindi è segnalata come non supportata.")
+        return KIND_UNSUPPORTED
 
     def make_unsupported(self, activity: Activity, reason: str) -> None:
         """Spec: "Anything else is not an error: it is listed in the report, and the branches behind it
@@ -1283,9 +1472,39 @@ class _ExportReader:
         """
         mapped = self.map_attribute(condition.source, condition.table, condition.field)
         result = condition if mapped is None else replace(condition, table=mapped[0], field=mapped[1])
+        path = self.condition_path(result.table, condition.path) if condition.source == SOURCE_CONTACT else ()
+        result = replace(result, path=path)
         if condition.value_attribute is not None:
             result = self.normalise_comparison(result, condition)
         return result
+
+    def condition_path(self, own_table: str, relationship_ids: tuple[str, ...]) -> tuple[str, ...]:
+        """Spec, step 3, "Tables reached through other tables": "The export names the path: the attribute path of
+        the condition (the relationship ids in AttributePath and UiMetaData)".
+
+        ``relationship_ids`` (criteria.py: the ``groupToSetRelationshipId`` of ``UiMetaData``, then the
+        ``RelationshipID`` of each ``<AttributePath>``) become the tables between the contact and ``own_table``,
+        nearest the contact first: a group-to-set relationship gives the table linked to the contact (its right
+        item), a relationship between two tables gives its left table, following the chain from the contact. An
+        id that is not an attributeRelationships entity of the export is dropped, with a warning.
+        """
+        links: list[_Link] = []
+        for relationship_id in relationship_ids:
+            link = self.relationship_links.get(relationship_id)
+            if link is None:
+                self.warn(f"Una condizione legge la sua tabella attraverso la relazione {relationship_id}, che non è "
+                          "nell'export: la relazione è ignorata nel percorso dal contatto alla tabella.")
+            else:
+                links.append(link)
+        tables: list[Optional[str]] = [link.right_table for link in links if link.group_to_set]
+        current = tables[-1] if tables else None
+        chain = [link for link in links if not link.group_to_set]
+        while chain:
+            link = next((item for item in chain if item.left_table == current), chain[0])
+            chain.remove(link)
+            tables.append(link.left_table)
+            current = link.right_table
+        return _path_tables(tables, own_table)
 
     def map_attribute(self, source: str, owner: str, field_name: str, quiet: bool = False) -> Optional[tuple[str, str]]:
         """``(table, field)`` of an attribute as written: ``owner`` is the attribute set (Contact Data) or the
@@ -1365,46 +1584,76 @@ class _ExportReader:
         return linked
 
     def unsupported_condition(self, outcome: Outcome) -> Optional[str]:
-        """Why a mapped outcome formula cannot be evaluated, or None.
+        """Why a mapped outcome formula cannot be evaluated, or None (see ``unsupported_formula``)."""
+        return self.unsupported_formula(outcome.formula, f"il branch {outcome.label!r}")
 
-        Spec, operators: only the listed ones are understood, "the rest is reported, not guessed".
-        A condition on a table or field that is not in the export's schemas cannot be given a type,
-        a length or a nullability, so its split is reported as unsupported rather than guessed.
+    def unsupported_formula(self, formula: Optional[Formula], subject: str) -> Optional[str]:
+        """Why a mapped formula cannot be evaluated, or None; ``subject`` names it in the reason ("il branch 'X'").
+
+        Spec, operators: only the listed ones are understood, "the rest is reported, not guessed"
+        (``criteria.OPERATORS``). A condition on a table or field that is not in the export's schemas cannot
+        be given a type, a length or a nullability, so it is reported as unsupported rather than guessed.
         Spec, "Extensions beyond the pilot": Journey Data of an event other than the trigger's, an
         attribute set with no relationship in the export ("relationship missing in the export"), a
         Between value not written ``low|high`` and an attribute comparison in any form other than the
-        supported one are unsupported.
+        supported one are unsupported. Spec, step 3: a relative date value is checked by ``unsupported_relative``.
         """
-        label = outcome.label
-        for condition in formula_conditions(outcome.formula):
+        for condition in formula_conditions(formula):
             if condition.operator not in OPERATORS:
-                return f"il branch {label!r} usa l'operatore {condition.operator!r}, che il PoC non supporta"
+                return f"{subject} usa l'operatore {condition.operator!r}, che il PoC non supporta"
             if condition.source == SOURCE_JOURNEY and (self.entry is None or condition.table != self.entry.table):
                 name = self.event_name(condition.table)
                 event = f"{condition.table} ({name})" if name else condition.table
                 trigger = self.entry.key if self.entry is not None else ""
-                return (f"il branch {label!r} legge Event.{condition.table}.{condition.field}, cioè i Journey Data "
+                return (f"{subject} legge Event.{condition.table}.{condition.field}, cioè i Journey Data "
                         f"dell'entry event {event}, che non è l'entry event del trigger del journey ({trigger})")
             if condition.source == SOURCE_CONTACT and condition.table in self.missing_relationships:
-                return (f"il branch {label!r} legge {condition.table}.{condition.field}, ma l'attribute set di "
+                return (f"{subject} legge {condition.table}.{condition.field}, ma l'attribute set di "
                         f"{condition.table} non ha alcuna relazione nell'export, quindi non si sa come la tabella è "
                         "collegata al contatto (relazione mancante nell'export)")
             table = self.tables.get(condition.table)
             if table is None:
-                return (f"il branch {label!r} legge {condition.table}.{condition.field}, ma la tabella "
+                return (f"{subject} legge {condition.table}.{condition.field}, ma la tabella "
                         f"{condition.table!r} non è nell'export")
-            if table.field(condition.field) is None:
-                return (f"il branch {label!r} legge {condition.table}.{condition.field}, ma il campo "
+            field = table.field(condition.field)
+            if field is None:
+                return (f"{subject} legge {condition.table}.{condition.field}, ma il campo "
                         f"{condition.field!r} non è nello schema di {table.name}")
             if condition.operator == "Between" and condition.value_attribute is None \
                     and between_bounds(condition.value) is None:
-                return (f"il branch {label!r} usa Between con il valore {condition.value!r}, che non è nella forma "
+                return (f"{subject} usa Between con il valore {condition.value!r}, che non è nella forma "
                         "basso|alto")
             if condition.value_attribute is not None and not self.supported_comparison(condition):
-                return (f"il branch {label!r} confronta {condition.table}.{condition.field} con l'attributo "
+                return (f"{subject} confronta {condition.table}.{condition.field} con l'attributo "
                         f"{condition.value_attribute}: è supportato solo il confronto con Equal tra il campo che "
                         "collega una tabella al contatto e la chiave del contatto, letto come \"il contatto ha "
                         "una riga nella tabella\"")
+            problem = self.unsupported_relative(condition, field, subject)
+            if problem is not None:
+                return problem
+        return None
+
+    def unsupported_relative(self, condition: Condition, field: Field, subject: str) -> Optional[str]:
+        """Spec, step 3, "Relative dates in conditions": a value written ``;<sign>;<n>;<unit>`` "compares the field
+        with the clock's date moved by n units" and "Any other value form, unit or operator is unsupported".
+
+        A relative value (``Condition.relative``, set by criteria.py) is unsupported on a field whose type is not
+        Date, in a unit that ``criteria.relative_units()`` does not list, and with an operator that
+        ``criteria.RELATIVE_OPERATORS`` does not list ("The operators that take such a value are After,
+        AtOrAfter, Before, AtOrBefore"). None when the condition has no relative value or is supported.
+        """
+        if condition.relative is None:
+            return None
+        written = f"{condition.table}.{condition.field} {condition.operator} {condition.value!r}"
+        if field.type != "Date":
+            return f"{subject} usa un valore relativo a oggi su un campo di tipo {field.type} ({written})"
+        units = {str(unit).lower() for unit in criteria_rules.relative_units()}
+        if condition.relative.unit.lower() not in units:
+            return (f"{subject} usa un valore relativo a oggi in {condition.relative.unit!r}, un'unità che il "
+                    f"generatore non supporta ({written})")
+        if condition.operator not in criteria_rules.RELATIVE_OPERATORS:
+            return (f"{subject} usa un valore relativo a oggi con l'operatore {condition.operator!r}, che non lo "
+                    f"accetta ({written})")
         return None
 
     def supported_comparison(self, condition: Condition) -> bool:
@@ -1461,12 +1710,17 @@ class _ExportReader:
     def read_wait_attribute(self, activity: Activity, raw: dict) -> None:
         """Plan: the field comes from ``configurationArguments.waitEndDateAttributeExpression`` (last quoted
         segment = field, segment before it = attribute set -> table); ``metaData.attribute.id`` is the fallback.
+
+        Spec, step 3: the offset and the time of day are read by ``read_wait_offset``; the attribute sets the
+        expression names between the contact and the field's set are the wait's path (``expression_path``).
         """
         config = _dict(raw.get("configurationArguments"))
         activity.wait_timezone = _text_or_none(config.get("timeZone")) or None
+        self.read_wait_offset(activity, config)
         expression = config.get("waitEndDateAttributeExpression")
         found = _expression_field(expression)
         event_key = _event_key(expression)
+        from_expression = found is not None
         if found is None:
             attribute_id = _dict(_dict(raw.get("metaData")).get("attribute")).get("id")
             parts = split_attribute(attribute_id) if isinstance(attribute_id, str) else None
@@ -1486,12 +1740,52 @@ class _ExportReader:
             table = self.entry.table
         else:
             table = self.table_for_set(set_name)
+            if from_expression:
+                activity.wait_path = self.expression_path(expression, table)
         activity.wait_field = (table, self.schema_field(table, field_name))
-        offset = _int_or_none(config.get("waitDuration"))
-        if offset:
-            self.warn(f"Wait {_named(activity)}: ha una waitDuration di {offset} {config.get('waitUnit')} "
-                      f"in aggiunta alla data in {table}.{activity.wait_field[1]}; il generatore non tiene conto "
-                      f"di questo scarto.")
+
+    def read_wait_offset(self, activity: Activity, config: dict) -> None:
+        """Spec, step 3, "The clock": "A wait by attribute holds the contact until the date in its field plus its
+        offset (waitDuration and waitUnit, which may be negative ...), at the time of day given by specifiedTime
+        when it has one, otherwise at the time of day held in the field."
+
+        An offset of 0, or none, is no offset (None). An offset in a unit not in WAIT_UNITS is kept as written and
+        reported, because the end of the wait cannot be computed.
+        """
+        amount = _int_or_none(config.get("waitDuration"))
+        if amount:
+            activity.wait_offset_amount = amount
+            activity.wait_offset_unit = _text_or_none(config.get("waitUnit")) or None
+            if (activity.wait_offset_unit or "").strip().upper() not in WAIT_UNITS:
+                self.warn(f"Wait {_named(activity)}: termina {amount} {activity.wait_offset_unit!r} rispetto alla data "
+                          "del suo campo, un'unità che il generatore non conosce, quindi non è possibile calcolare "
+                          "quando il wait termina.")
+        activity.wait_time_of_day = (_text_or_none(config.get("specifiedTime")) or "").strip() or None
+
+    def expression_path(self, expression: Any, own_table: str) -> tuple[str, ...]:
+        """Spec, step 3, "Tables reached through other tables": the tables the wait's expression names between the
+        contact and the table of its field, nearest the contact first.
+
+        ``{{Contact.Attribute.Contacts.PublicHoliday_Entry.PublicHoliday_DE."PHEnd"}}`` -> ``(PublicHoliday_Entry,)``:
+        the segments after ``Contact.Attribute``, without a first segment that is not an attribute set
+        (``Contacts``, or an attribute group), up to the set of the field (excluded); set names are mapped to
+        tables as a condition's are. Any other kind of expression gives no path.
+        """
+        segments = _personalisation_segments(expression)
+        if segments[:2] != ["Contact", "Attribute"]:
+            return ()
+        sets = segments[2:-2]
+        if sets and sets[0] not in self.set_tables:
+            sets = sets[1:]
+        return _path_tables([self.table_for_set(set_name) for set_name in sets], own_table)
+
+    def read_sms(self, activity: Activity, raw: dict) -> None:
+        """Spec, step 3, "SMS sends": "SMSSYNC is a send to the phone number of the journey's default mobile
+        number ... It has no branching." ``sms_asset_id`` is ``configurationArguments.assetId`` as written (a
+        resolved reference gives the asset id); ``sms_name`` is the activity name."""
+        asset_id = _dict(raw.get("configurationArguments")).get("assetId")
+        activity.sms_asset_id = None if asset_id is None or asset_id == "" else str(asset_id)
+        activity.sms_name = activity.name
 
     def read_wait_sto(self, activity: Activity, raw: dict) -> None:
         """Send-time wait: the email goes out within ``params.slidingWindowHours``.

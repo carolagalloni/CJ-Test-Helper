@@ -45,6 +45,7 @@ from cjhelper.model import (
     ConditionGroup,
     CoverageResult,
     DateBoundFilter,
+    DateOffsetFilter,
     EmailAsset,
     EntryEvent,
     EqualityFilter,
@@ -1254,3 +1255,111 @@ def test_long_fixed_window_is_not_warned_and_a_short_wait_date_is():
     slow = next(c for c in world.coverage.cases if c.manual_actions and c.end_activity_key == "ENG-2")
     assert slow.action_windows[0].short and slow.action_windows[0].deadline == "2026-10-11 10:00"
     assert any("'Slow'" in w and "2026-10-11 10:00" in w and "meno di un'ora" in w for w in data.warnings)
+
+
+# ---------------------------------------------------------------------------
+# Step 3: aliases, columns the entry query derives, date offsets, SMS, waits with an offset, managed tables
+# ---------------------------------------------------------------------------
+
+def test_alias_members_hold_the_value_of_the_representative():
+    """Spec, step 3, "Columns the entry query derives and columns it copies": the coverage names the group by its
+    source column; the entry copy comes from the SELECT, a member nobody computes gets the value directly."""
+    world = build_world()
+    for table in (ENTRY, MASTER):
+        world.package.tables[table].fields.append(Field("Tier", "Text", 20, False, True, None, 99))
+    world.package.tables[MASTER].fields.append(Field("TierCopy", "Text", 20, False, True, None, 100))
+    world.model.entry_query.select.append(SelectItem("Tier", SelectColumn(ColumnRef(MASTER, "Tier"))))
+    world.model.aliases = [[(ENTRY, "Tier"), (MASTER, "Tier"), (MASTER, "TierCopy")]]
+    world.coverage.contact_fields.append((MASTER, "Tier"))
+    tiers = {"S01-C01": "Gold", "S01-C02": "Silver", "S02-C01": None}
+    for case in world.coverage.cases:
+        case.contact_values[(MASTER, "Tier")] = tiers[case.id]
+    data = run(world)
+    masters, entries = by_key(rows_of(data, MASTER), "ContactId"), by_key(rows_of(data, ENTRY), "ContactId")
+    for case in world.coverage.cases:
+        tier = tiers[case.id]
+        for key in case.contact_keys:
+            assert masters[key]["Tier"] == masters[key]["TierCopy"] == entries[key]["Tier"] == tier
+
+
+def test_entry_column_computed_by_an_unsupported_expression_takes_the_case_value():
+    """Spec, step 3: an entry column that a split reads and that the query computes with an expression the generator
+    does not understand takes the value the case needs, with a warning in place of a placeholder."""
+    world = build_world()
+    world.coverage.contact_fields.append((ENTRY, "Weird"))
+    for case in world.coverage.cases:
+        case.contact_values[(ENTRY, "Weird")] = "False" if case.id == "S01-C02" else "True"
+    data = run(world)
+    entries = by_key(rows_of(data, ENTRY), "ContactId")
+    assert {entries[k]["Weird"] for k in case_keys(world, "S01-C01")} == {"True"}
+    assert {entries[k]["Weird"] for k in case_keys(world, "S01-C02")} == {"False"}
+    assert any(w.startswith(f"{ENTRY}.Weird: la entry query la calcola con un'espressione non compresa") and
+               "import diretto" in w for w in data.warnings)
+    assert not any("Weird" in p for p in data.placeholders)
+    assert any("Weird" in p for p in run(build_world()).placeholders)   # not read by a split: placeholder as before
+
+
+def test_date_offset_filter_gives_the_generation_time_moved_by_the_days():
+    world = build_world()
+    query = world.model.entry_query
+    query.filters = [DateOffsetFilter(ColumnRef(MASTER, "BirthDate"), -1),
+                     DateOffsetFilter(ColumnRef(MASTER, "ReminderDate"), 2)] + query.filters
+    data = run(world)
+    assert {r["BirthDate"] for r in rows_of(data, MASTER)} == {YESTERDAY}
+    assert {r["ReminderDate"] for r in rows_of(data, MASTER)} == {"2026-10-13 09:30"}
+
+
+def sms_world(**settings):
+    world = build_world(**settings)
+    world.package.journey.default_mobile_field = "Mobile"
+    next(c for c in world.coverage.cases if c.id == "S01-C02").sms_sent = ["SMS-1"]   # the others send none
+    return world
+
+
+def test_sms_case_gives_its_first_contact_the_real_number_in_the_entry_and_the_source_column():
+    """Spec, "Phone" and step 3, "SMS sends": one contact of the case gets the real number in the default mobile
+    column and in the column the SELECT copies it from (``M.Mobile``); every other phone gets the fake number."""
+    world = sms_world(real_phone="393401234567", fake_phone="000111")
+    data = run(world)
+    first = case_keys(world, "S01-C02")[0]
+    assert [c.key for c in data.contacts if c.uses_real_phone] == [first]
+    for table in (ENTRY, MASTER):
+        phones = {row["ContactId"]: row["Mobile"] for row in rows_of(data, table)}
+        assert phones.pop(first) == "393401234567"
+        assert set(phones.values()) == {"000111"}
+    assert not any("SMS" in w for w in data.warnings)
+
+
+@pytest.mark.parametrize("real_phone, mobile_field", [("", "Mobile"), ("393401234567", None)])
+def test_sms_without_a_real_number_or_a_mobile_column_is_warned_once(real_phone, mobile_field):
+    world = sms_world(real_phone=real_phone)
+    world.package.journey.default_mobile_field = mobile_field
+    data = run(world)
+    assert len([w for w in data.warnings if "non si possono verificare" in w and "SMS" in w]) == 1
+    assert not any(c.uses_real_phone for c in data.contacts)
+    assert {r["Mobile"] for r in rows_of(data, MASTER)} == {world.settings.fake_phone}
+
+
+def test_wait_by_attribute_deadline_follows_the_offset_and_the_time_of_day():
+    """Spec, step 3, "The clock": a wait ends at its date plus its offset, at its time of day when it has one."""
+    plain_world = build_world()
+    plain = run(plain_world)
+    assert next(c for c in plain_world.coverage.cases if c.id == "S01-C01").not_before == "2026-10-12 09:30"
+    world = build_world()
+    wait = world.package.journey.activities["WAIT-2"]
+    wait.wait_offset_amount, wait.wait_offset_unit, wait.wait_time_of_day = 2, "DAYS", "08:00"
+    run(world)
+    first = next(c for c in world.coverage.cases if c.id == "S01-C01")
+    assert first.not_before == "2026-10-14 08:00"                        # 12 October 09:30 + 2 days, at 08:00
+    assert {r["ReminderDate"] for r in rows_of(plain, MASTER) if r["ContactId"] in first.contact_keys} \
+        == {"2026-10-12 09:30"}                                         # the date written is the old rule's
+
+
+def test_managed_table_keeps_its_csv_and_notes_that_it_is_synchronized():
+    world = build_world()
+    world.package.tables[CONFIG].managed = True
+    data = run(world)
+    assert CONFIG in data.tables and len(rows_of(data, CONFIG)) == 2
+    notes = [w for w in data.warnings if CONFIG in w and "sincronizzata dal CRM" in w]
+    assert len(notes) == 1 and "arriveranno anche dalla sincronizzazione" in notes[0]
+    assert not any("non si può importare" in w or "assunzione" in w for w in notes)

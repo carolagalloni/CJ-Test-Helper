@@ -16,6 +16,7 @@ from sqlglot import exp
 from cjhelper.model import (
     ColumnRef,
     DateBoundFilter,
+    DateOffsetFilter,
     EqualityFilter,
     Field,
     IsNullFilter,
@@ -416,6 +417,143 @@ def test_check_active_campaigns_query():
 
 
 # ---------------------------------------------------------------------------
+# Step 3: an entry query shaped like those of the retention exports
+# (invented tables and columns, the same constructs: renamed and swapped columns, a CASE on a LEFT JOIN
+# table, a JOIN and a LEFT JOIN, an equality and a date-offset filter, comments in the WHERE clause)
+# ---------------------------------------------------------------------------
+
+RET_PROFILE = "Customer_Profile_DE"
+RET_MEMBER = "CampaignMember_Sync_3"
+RET_BACKUP = "Entry_Retention_Test_Backup"
+RET_ENTRY = "Entry_Retention_Test"
+
+RET_PROFILE_FIELDS = [
+    ("ContactId", "Text", 250, True, False, None, 0),
+    ("Emailaddress", "EmailAddress", 254, False, True, None, 1),
+    ("FirstName", "Text", 50, False, True, None, 2),
+    ("Phone", "Phone", 50, False, True, None, 3),
+    ("MobilePhone", "Phone", 50, False, True, None, 4),
+    ("City", "Text", 50, False, True, None, 5),
+    ("Contract_EndDate", "Date", None, False, True, None, 6),
+    ("Request_SubmittedDate", "Date", None, False, True, None, 7),
+]
+RET_MEMBER_FIELDS = [
+    ("Id", "Text", 18, True, False, None, 0),
+    ("ContactId", "Text", 18, False, True, None, 1),
+    ("Campaign_Label__c", "Text", 255, False, True, None, 2),
+    ("Offer_Code__c", "Text", 50, False, True, None, 3),
+    ("CreatedDate", "Date", None, False, True, None, 4),
+]
+RET_BACKUP_FIELDS = [
+    ("ContactId", "Text", 250, True, False, None, 0),
+    ("Letter_Timestamp", "Date", None, False, True, None, 1),
+    ("Call_Timestamp", "Date", None, False, True, None, 2),
+]
+
+RET_ENTRY_SQL = (
+    "SELECT\n"
+    "M.ContactId,\n"
+    "M.Emailaddress,\n"
+    "M.FirstName,\n"
+    "M.Phone as MobilePhone,\n"
+    "M.MobilePhone as Phone,\n"
+    "M.City,\n"
+    "M.Contract_EndDate,\n"
+    "CM.Campaign_Label__c as CampaignName,\n"
+    "CM.Offer_Code__c as OfferCode,\n"
+    "CM.Id AS CMId,\n"
+    "B.Letter_Timestamp,\n"
+    "CASE WHEN B.Letter_Timestamp IS NOT NULL\n"
+    "      AND CAST(B.Letter_Timestamp AS DATE) BETWEEN\n"
+    "          CAST(DATEADD(day, -60, M.Contract_EndDate) AS DATE)\n"
+    "          AND CAST(DATEADD(day, -10, M.Contract_EndDate) AS DATE)\n"
+    "      AND B.Letter_Timestamp >= M.Request_SubmittedDate\n"
+    "     THEN 'True' ELSE 'False' END AS Letter_Identifier,\n"
+    "B.Call_Timestamp\n"
+    "\n"
+    f"FROM [{RET_PROFILE}] M\n"
+    f"JOIN [{RET_MEMBER}] CM on CM.ContactId = M.ContactId\n"
+    f"LEFT JOIN [{RET_BACKUP}] B on CM.ContactId = B.ContactId\n"
+    "WHERE  \n"
+    "       CM.Campaign_Label__c = 'RETENTION_TEST_CAMPAIGN'         \n"
+    "/*and cast(CM.CreatedDate as Date) = cast(dateadd(dd,-1,getdate()) as Date)*/\n"
+    "and {date_filter}\n"
+    "/*and cast(CM.CreatedDate as Date) = cast(getdate() as Date)*/"
+)
+
+RET_CASE_TEXT = (
+    "CASE WHEN NOT B.Letter_Timestamp IS NULL AND CAST(B.Letter_Timestamp AS DATE) BETWEEN "
+    "CAST(DATEADD(DAY, -60, M.Contract_EndDate) AS DATE) AND CAST(DATEADD(DAY, -10, M.Contract_EndDate) AS DATE) "
+    "AND B.Letter_Timestamp >= M.Request_SubmittedDate THEN 'True' ELSE 'False' END"
+)
+
+
+def retention_tables() -> dict[str, Table]:
+    tables = [
+        make_table(RET_PROFILE, RET_PROFILE_FIELDS, "ContactId"),
+        make_table(RET_MEMBER, RET_MEMBER_FIELDS),
+        make_table(RET_BACKUP, RET_BACKUP_FIELDS, "ContactId"),
+    ]
+    return {table.name: table for table in tables}
+
+
+@pytest.mark.parametrize("date_filter, days", [
+    ("cast(CM.CreatedDate as Date) = cast(dateadd(dd,-1,getdate()) as Date)", -1),
+    ("cast(CM.CreatedDate as Date) = cast(getdate() as Date)", 0),
+    ("cast(CM.CreatedDate as Date) = dateadd(day,-2,cast(getdate() as Date))", -2),
+])
+def test_retention_entry_query_is_read_in_full(date_filter, days):
+    parsed = parse(RET_ENTRY_SQL.format(date_filter=date_filter), name="Q_RETENTION_ENTRY", target=RET_ENTRY,
+                   tables=retention_tables())
+    assert parsed.name == "Q_RETENTION_ENTRY"
+    assert parsed.target_table == RET_ENTRY
+    assert parsed.select_all is False
+    assert parsed.sources == [
+        TableRef(RET_PROFILE, "M", optional=False),
+        TableRef(RET_MEMBER, "CM", optional=False),
+        TableRef(RET_BACKUP, "B", optional=True),
+    ]
+    assert parsed.joins == [
+        JoinEquality(ColumnRef(RET_MEMBER, "ContactId"), ColumnRef(RET_PROFILE, "ContactId")),
+        JoinEquality(ColumnRef(RET_MEMBER, "ContactId"), ColumnRef(RET_BACKUP, "ContactId")),
+    ]
+    assert parsed.filters == [
+        EqualityFilter(ColumnRef(RET_MEMBER, "Campaign_Label__c"), "RETENTION_TEST_CAMPAIGN"),
+        DateOffsetFilter(ColumnRef(RET_MEMBER, "CreatedDate"), days),
+    ]
+    assert parsed.select == [
+        SelectItem("ContactId", SelectColumn(ColumnRef(RET_PROFILE, "ContactId"))),
+        SelectItem("Emailaddress", SelectColumn(ColumnRef(RET_PROFILE, "Emailaddress"))),
+        SelectItem("FirstName", SelectColumn(ColumnRef(RET_PROFILE, "FirstName"))),
+        SelectItem("MobilePhone", SelectColumn(ColumnRef(RET_PROFILE, "Phone"))),
+        SelectItem("Phone", SelectColumn(ColumnRef(RET_PROFILE, "MobilePhone"))),
+        SelectItem("City", SelectColumn(ColumnRef(RET_PROFILE, "City"))),
+        SelectItem("Contract_EndDate", SelectColumn(ColumnRef(RET_PROFILE, "Contract_EndDate"))),
+        SelectItem("CampaignName", SelectColumn(ColumnRef(RET_MEMBER, "Campaign_Label__c"))),
+        SelectItem("OfferCode", SelectColumn(ColumnRef(RET_MEMBER, "Offer_Code__c"))),
+        SelectItem("CMId", SelectColumn(ColumnRef(RET_MEMBER, "Id"))),
+        SelectItem("Letter_Timestamp", SelectColumn(ColumnRef(RET_BACKUP, "Letter_Timestamp"))),
+        SelectItem("Letter_Identifier", SelectUnsupported(RET_CASE_TEXT)),
+        SelectItem("Call_Timestamp", SelectColumn(ColumnRef(RET_BACKUP, "Call_Timestamp"))),
+    ]
+    assert parsed.warnings == [
+        f"Query Q_RETENTION_ENTRY: la tabella {RET_BACKUP} è unita con un LEFT JOIN; viene letta come inner join",
+        f"Query Q_RETENTION_ENTRY: colonna Letter_Identifier: espressione non compresa: {RET_CASE_TEXT}",
+        "Query Q_RETENTION_ENTRY: la query copia Phone in MobilePhone e MobilePhone in Phone: "
+        "verifica che lo scambio sia voluto",
+    ]
+
+
+def test_retention_backup_query_is_select_star():
+    tables = retention_tables()
+    tables[RET_ENTRY] = make_table(RET_ENTRY, [("ContactId", "Text", 250, True, False, None, 0)], "ContactId")
+    parsed = parse(f"SELECT * \nFROM [{RET_ENTRY}]", name="Q_RETENTION_BACKUP", target=RET_BACKUP, tables=tables)
+    assert parsed.select_all is True
+    assert parsed.sources == [TableRef(RET_ENTRY, None)]
+    assert (parsed.select, parsed.joins, parsed.filters, parsed.warnings) == ([], [], [], [])
+
+
+# ---------------------------------------------------------------------------
 # WHERE filters
 # ---------------------------------------------------------------------------
 
@@ -546,6 +684,107 @@ def test_unsupported_filter_text_leaves_comments_out():
 
 
 # ---------------------------------------------------------------------------
+# WHERE filters: the date part of a column against the current date moved by days (spec, step 3)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("condition, days", [
+    # The three spellings of the spec and of the retention exports.
+    ("CAST(C.START_DATE AS DATE) = CAST(DATEADD(day, -1, GETDATE()) AS DATE)", -1),
+    ("cast(C.START_DATE as Date) = cast(dateadd(dd,-1,getdate()) as Date)", -1),
+    ("CAST(C.START_DATE AS DATE) = CAST(GETDATE() AS DATE)", 0),
+    ("cast(C.START_DATE as Date) = cast(getdate() as Date)", 0),
+    ("CAST(C.START_DATE AS DATE) = DATEADD(day, -2, CAST(GETDATE() AS DATE))", -2),
+    ("cast(C.START_DATE as Date) = dateadd(day,-2,cast(getdate() as Date))", -2),
+    # Either side, the other day units and the other current-date calls.
+    ("CAST(DATEADD(d, -3, GETDATE()) AS DATE) = CAST(C.START_DATE AS DATE)", -3),
+    ("DATEADD(DD, 2, CAST(GETDATE() AS DATE)) = CAST(START_DATE AS DATE)", 2),
+    ("CAST(C.START_DATE AS DATE) = CAST(GETUTCDATE() AS DATE)", 0),
+    ("CAST(C.START_DATE AS DATE) = CAST(SYSDATETIME() AS DATE)", 0),
+    ("CAST(C.START_DATE AS DATE) = CAST(CURRENT_TIMESTAMP AS DATE)", 0),
+    ("CAST(C.START_DATE AS DATE) = CAST(DATEADD(Day, +1, GETDATE()) AS DATE)", 1),
+    # CONVERT(DATE, ...) and TRY_CAST, as the date bounds accept them.
+    ("CONVERT(DATE, C.START_DATE) = CONVERT(DATE, DATEADD(day, -1, GETDATE()))", -1),
+    ("CONVERT(DATE, C.START_DATE, 104) = DATEADD(day, 5, CONVERT(DATE, GETUTCDATE()))", 5),
+    ("TRY_CAST(C.START_DATE AS DATE) = CAST(GETDATE() AS DATE)", 0),
+    # Parentheses and AT TIME ZONE pass through, as for the date bounds.
+    ("(CAST(C.START_DATE AS DATE)) = (CAST(GETUTCDATE() AT TIME ZONE 'UTC' AS DATE))", 0),
+    # Other units and amounts whose meaning is still a whole number of days.
+    ("CAST(C.START_DATE AS DATE) = CAST(DATEADD(week, -1, GETDATE()) AS DATE)", -7),
+    ("CAST(C.START_DATE AS DATE) = DATEADD(wk, 2, CAST(GETDATE() AS DATE))", 14),
+    ("CAST(C.START_DATE AS DATE) = CAST(DATEADD(dayofyear, -1, GETDATE()) AS DATE)", -1),
+    ("CAST(C.START_DATE AS DATE) = CAST(DATEADD(dw, 1, GETDATE()) AS DATE)", 1),
+    ("CAST(C.START_DATE AS DATE) = CAST(DATEADD(hour, -48, GETDATE()) AS DATE)", -2),
+    ("CAST(C.START_DATE AS DATE) = CAST(DATEADD(minute, 1440, GETDATE()) AS DATE)", 1),
+    ("CAST(C.START_DATE AS DATE) = CAST(DATEADD(hh, 12, DATEADD(hh, 12, GETDATE())) AS DATE)", 1),
+    ("CAST(C.START_DATE AS DATE) = CAST(DATEADD(day, (-1) * 7, GETDATE()) AS DATE)", -7),
+    ("CAST(C.START_DATE AS DATE) = CAST(DATEADD(day, -(2), GETDATE()) AS DATE)", -2),
+    ("CAST(C.START_DATE AS DATE) = CAST(DATEADD(day, 10 - 11, GETDATE()) AS DATE)", -1),
+    ("CAST(C.START_DATE AS DATE) = DATEADD(day, -1, DATEADD(day, -1, CAST(GETDATE() AS DATE)))", -2),
+    # A date part made a DATETIME again is still midnight of that day.
+    ("CAST(C.START_DATE AS DATE) = CAST(CAST(GETDATE() AS DATE) AS DATETIME)", 0),
+    # The column moved by days instead of the current date.
+    ("DATEADD(day, 1, CAST(C.START_DATE AS DATE)) = CAST(GETDATE() AS DATE)", -1),
+    ("CAST(DATEADD(day, 1, C.START_DATE) AS DATE) = CAST(DATEADD(day, -1, GETDATE()) AS DATE)", -2),
+])
+def test_date_offset_forms(condition, days):
+    parsed = parse(f"SELECT C.CampaignName {FROM_CONFIG} WHERE C.ACTIVE = 'True' AND {condition}")
+    assert parsed.filters == [
+        EqualityFilter(ColumnRef(CONFIG, "ACTIVE"), "True"),
+        DateOffsetFilter(ColumnRef(CONFIG, "START_DATE"), days),
+    ]
+    assert parsed.warnings == []
+
+
+@pytest.mark.parametrize("condition", [
+    # Not an equality: an inequality against a moved date stays unsupported.
+    "CAST(C.START_DATE AS DATE) >= CAST(DATEADD(day, -1, GETDATE()) AS DATE)",
+    "CAST(C.START_DATE AS DATE) < DATEADD(day, -2, CAST(GETDATE() AS DATE))",
+    "CAST(C.START_DATE AS DATE) <> CAST(GETDATE() AS DATE)",
+    "CAST(C.START_DATE AS DATE) BETWEEN CAST(DATEADD(day, -7, GETDATE()) AS DATE) AND CAST(GETDATE() AS DATE)",
+    # One side keeps its time: T-SQL compares the full date and time, true only at midnight.
+    "C.START_DATE = CAST(GETDATE() AS DATE)",
+    "C.START_DATE = CAST(DATEADD(day, -1, GETDATE()) AS DATE)",
+    "CAST(C.START_DATE AS DATE) = DATEADD(day, -1, GETDATE())",
+    "CAST(C.START_DATE AS DATE) = GETDATE()",
+    "CAST(C.START_DATE AS DATETIME) = CAST(GETDATE() AS DATE)",
+    "C.START_DATE = DATEADD(day, -1, GETDATE())",
+    # A move that is not a whole number of days, or whose length depends on the date.
+    "CAST(C.START_DATE AS DATE) = CAST(DATEADD(hour, -12, GETDATE()) AS DATE)",
+    "CAST(C.START_DATE AS DATE) = CAST(DATEADD(month, -1, GETDATE()) AS DATE)",
+    "CAST(C.START_DATE AS DATE) = CAST(DATEADD(yy, -1, GETDATE()) AS DATE)",
+    "CAST(C.START_DATE AS DATE) = CAST(DATEADD(quarter, 1, GETDATE()) AS DATE)",
+    "CAST(C.START_DATE AS DATE) = CAST(DATEADD(ms, 86400000, GETDATE()) AS DATE)",
+    "CAST(C.START_DATE AS DATE) = DATEADD(hour, 24, CAST(GETDATE() AS DATE))",   # T-SQL refuses hours on a DATE
+    "CAST(DATEADD(hour, 1, C.START_DATE) AS DATE) = CAST(GETDATE() AS DATE)",
+    # An amount that is not a whole-number constant.
+    "CAST(C.START_DATE AS DATE) = CAST(DATEADD(day, C.CHANNEL1, GETDATE()) AS DATE)",
+    "CAST(C.START_DATE AS DATE) = CAST(DATEADD(day, 1.5, GETDATE()) AS DATE)",
+    "CAST(C.START_DATE AS DATE) = CAST(DATEADD(day, '-1', GETDATE()) AS DATE)",
+    "CAST(C.START_DATE AS DATE) = CAST(DATEADD(day, 2147483648, GETDATE()) AS DATE)",
+    "CAST(C.START_DATE AS DATE) = CAST(DATEADD(day, 4000000, GETDATE()) AS DATE)",
+    # Not a column against the current date.
+    "CAST(C.START_DATE AS DATE) = CAST(C.END_DATE AS DATE)",
+    "CAST(GETDATE() AS DATE) = CAST(DATEADD(day, 0, GETDATE()) AS DATE)",
+    "CAST(C.START_DATE AS DATE) = CAST('2026-10-14' AS DATE)",
+    "CAST(C.START_DATE AS VARCHAR(10)) = CAST(GETDATE() AS VARCHAR(10))",
+    "CAST(UPPER(C.START_DATE) AS DATE) = CAST(GETDATE() AS DATE)",
+    "CAST(C.START_DATE AS DATE) = CAST(GETDATE() - 1 AS DATE)",
+])
+def test_other_comparisons_with_a_moved_date_are_unsupported(condition):
+    parsed = parse(f"SELECT C.CampaignName {FROM_CONFIG} WHERE C.ACTIVE = 'True' AND {condition}")
+    assert parsed.filters[0] == EqualityFilter(ColumnRef(CONFIG, "ACTIVE"), "True")
+    assert len(parsed.filters) == 2
+    assert isinstance(parsed.filters[1], UnsupportedFilter)
+    assert warned(parsed, "filtro non compreso", parsed.filters[1].text)
+
+
+def test_date_offset_on_an_unresolved_column_keeps_the_filter():
+    parsed = parse(f"SELECT C.CampaignName {FROM_CONFIG} WHERE CAST(CreatedDate AS DATE) = CAST(GETDATE() AS DATE)")
+    assert parsed.filters == [DateOffsetFilter(ColumnRef("", "CreatedDate"), 0)]
+    assert warned(parsed, "colonna CreatedDate", "nessuna tabella nota")
+
+
+# ---------------------------------------------------------------------------
 # Joins
 # ---------------------------------------------------------------------------
 
@@ -585,7 +824,54 @@ def test_left_join_is_read_as_an_inner_join_with_a_warning():
         f"SELECT M.ContactId FROM [{MASTER}] M LEFT JOIN [{TARGET}] T ON M.ContactId = T.SalesforceId"
     )
     assert parsed.joins == [JoinEquality(ColumnRef(MASTER, "ContactId"), ColumnRef(TARGET, "SalesforceId"))]
-    assert warned(parsed, TARGET, "LEFT JOIN", "inner join")
+    # Spec, step 3: "A LEFT JOIN source still gets one row per contact (read as an inner join, as before)".
+    assert parsed.sources == [TableRef(MASTER, "M"), TableRef(TARGET, "T", optional=True)]
+    assert parsed.warnings == [
+        f"Query Q_TEST: la tabella {TARGET} è unita con un LEFT JOIN; viene letta come inner join",
+    ]
+
+
+# Each join of a three-table chain: which sources may lack their row (optional), in FROM/JOIN order.
+@pytest.mark.parametrize("join, optional", [
+    ("JOIN", [False, False, False]),
+    ("INNER JOIN", [False, False, False]),
+    ("LEFT JOIN", [False, False, True]),
+    ("LEFT OUTER JOIN", [False, False, True]),
+    ("RIGHT JOIN", [True, True, False]),        # the tables before a RIGHT JOIN may lack their row
+    ("RIGHT OUTER JOIN", [True, True, False]),
+    ("FULL OUTER JOIN", [True, True, True]),
+    ("FULL JOIN", [True, True, True]),
+])
+def test_outer_joins_make_sources_optional(join, optional):
+    parsed = parse(
+        f"SELECT M.ContactId FROM [{MASTER}] M "
+        f"JOIN [{TARGET}] T ON M.ContactId = T.SalesforceId "
+        f"{join} [{CONFIG}] C ON T.Description = C.CampaignName"
+    )
+    assert [source.table for source in parsed.sources] == [MASTER, TARGET, CONFIG]
+    assert [source.optional for source in parsed.sources] == optional
+    assert len(parsed.joins) == 2   # still read as equalities, whatever the side
+    if join.split()[0] in ("LEFT", "RIGHT", "FULL"):
+        assert parsed.warnings == [
+            f"Query Q_TEST: la tabella {CONFIG} è unita con un {join.split()[0]} JOIN; viene letta come inner join",
+        ]
+    else:
+        assert parsed.warnings == []
+
+
+def test_left_join_after_a_right_join_keeps_every_optional_flag():
+    parsed = parse(
+        f"SELECT M.ContactId FROM [{MASTER}] M "
+        f"RIGHT JOIN [{TARGET}] T ON M.ContactId = T.SalesforceId "
+        f"LEFT JOIN [{CONFIG}] C ON T.Description = C.CampaignName"
+    )
+    assert parsed.sources == [
+        TableRef(MASTER, "M", optional=True),
+        TableRef(TARGET, "T", optional=False),
+        TableRef(CONFIG, "C", optional=True),
+    ]
+    assert all("letta come inner join" in warning for warning in parsed.warnings)
+    assert len(parsed.warnings) == 2
 
 
 @pytest.mark.parametrize("from_clause", [
@@ -815,6 +1101,55 @@ def test_alias_forms():
     assert parsed.warnings == []
 
 
+def test_columns_swapped_into_each_other_names_give_one_warning():
+    parsed = parse(f"SELECT M.ContactId, M.Phone AS MobilePhone, M.City, M.MobilePhone AS Phone {FROM_MASTER}")
+    assert parsed.select == [
+        SelectItem("ContactId", SelectColumn(ColumnRef(MASTER, "ContactId"))),
+        SelectItem("MobilePhone", SelectColumn(ColumnRef(MASTER, "Phone"))),
+        SelectItem("City", SelectColumn(ColumnRef(MASTER, "City"))),
+        SelectItem("Phone", SelectColumn(ColumnRef(MASTER, "MobilePhone"))),
+    ]
+    assert parsed.warnings == [
+        "Query Q_TEST: la query copia Phone in MobilePhone e MobilePhone in Phone: "
+        "verifica che lo scambio sia voluto",
+    ]
+
+
+def test_swap_is_found_ignoring_letter_case_and_named_as_the_first_item_writes_it():
+    parsed = parse(f"SELECT M.mobilephone AS PHONE, m.Phone AS MobilePhone {FROM_MASTER}")
+    assert parsed.warnings == [
+        "Query Q_TEST: la query copia mobilephone in PHONE e PHONE in mobilephone: "
+        "verifica che lo scambio sia voluto",
+    ]
+
+
+def test_each_swapped_pair_is_reported_once():
+    parsed = parse(
+        f"SELECT M.Phone AS MobilePhone, M.MobilePhone AS Phone, M.MobilePhone AS Phone, "
+        f"M.City AS Country, M.Country AS City {FROM_MASTER}"
+    )
+    assert parsed.warnings == [
+        "Query Q_TEST: la query copia Phone in MobilePhone e MobilePhone in Phone: verifica che lo scambio sia voluto",
+        "Query Q_TEST: la query copia City in Country e Country in City: verifica che lo scambio sia voluto",
+    ]
+
+
+@pytest.mark.parametrize("select", [
+    "M.Phone AS MobilePhone",                                   # a rename alone
+    "M.Phone AS MobilePhone, M.MobilePhone",                    # the other column keeps its name
+    "M.Phone AS MobilePhone, T.MobilePhone AS Phone",           # columns of two tables
+    "M.Phone AS Phone, M.MobilePhone AS MobilePhone",           # no rename
+    "M.Phone AS MobilePhone, UPPER(M.MobilePhone) AS Phone",    # not a plain column
+    "M.Phone AS MobilePhone, X.MobilePhone AS Phone",           # table unknown
+])
+def test_renames_that_are_not_a_swap_give_no_warning(select):
+    tables = pilot_tables()
+    tables[TARGET].fields.append(Field("MobilePhone", "Phone", 50, False, True, None, 4))
+    parsed = parse(f"SELECT {select} FROM [{MASTER}] M JOIN [{TARGET}] T ON M.ContactId = T.SalesforceId",
+                   tables=tables)
+    assert not warned(parsed, "scambio")
+
+
 def test_select_item_without_a_name_is_reported():
     parsed = parse(f"SELECT 'x', GETDATE() {FROM_MASTER}")
     assert parsed.select == [
@@ -983,6 +1318,12 @@ def test_unexpected_error_keeps_what_was_read(monkeypatch):
     "SELECT CONCAT() AS x",
     "SELECT FORMAT() AS x",
     "SELECT [a] FROM [T] AS [ ] WHERE [ ].[a] IS NULL",
+    "SELECT a FROM T WHERE CAST(a AS DATE) = CAST(DATEADD(day, " + " + ".join(["1"] * 3000) + ", GETDATE()) AS DATE)",
+    "SELECT a FROM T WHERE CAST(a AS DATE) = CAST(DATEADD(day, " + " * ".join(["99999"] * 300) + ", GETDATE()) AS DATE)",
+    "SELECT a FROM T WHERE CAST(a AS DATE) = DATEADD(day, 1)",
+    "SELECT a FROM T WHERE CAST(a AS DATE) = CONVERT(DATE)",
+    "SELECT a FROM T RIGHT JOIN (SELECT 1 AS b) s ON s.b = T.a FULL JOIN OPENJSON('[]') j ON 1 = 1",
+    "SELECT a AS b, a AS b, b AS a, T.a AS b, T.b AS a FROM T",
 ])
 def test_odd_sql_never_raises(sql):
     parsed = parse(sql)

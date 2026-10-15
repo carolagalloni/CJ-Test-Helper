@@ -25,13 +25,22 @@ Spec, "Extensions beyond the pilot":
   such a table inserts the row (``graph.Walker(..., row_fields=TableModel.existence_tested)``).
 - An entry source that no query fills (Run Once, recurring schedule, CloudPages form, API event) has no
   entry query to compare with: the entry check says so and does not apply.
+
+Spec, step 3, "Honest checks":
+
+- The entry check fails only on what it can verify. A column that a split reads and that the query computes with an
+  expression the generator does not understand, a filter it does not understand and a LEFT JOIN read as an inner
+  join are "not verified" notes. A filter on the date part moved by a number of days is verified on the date part;
+  a column the query does not populate and whose schema default is the current date accepts any date.
+- The simulation from the files runs with the same clock (``Settings.entry_time``, None = the generation time) and
+  the same exit criteria as the coverage: a path that leaves by the exit criteria ends with ``Step(wait, None)``.
 """
 
 from __future__ import annotations
 
 import csv
 import io
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 from . import graph, sqlparse_lite
@@ -49,6 +58,7 @@ from .model import (
     CheckResult,
     CoverageResult,
     DateBoundFilter,
+    DateOffsetFilter,
     EqualityFilter,
     FieldRef,
     GeneratedData,
@@ -401,10 +411,17 @@ class Checker:
                         ok = False
                     elif flt.bound == "end" and not (self.now <= d):
                         ok = False
+                elif isinstance(flt, DateOffsetFilter):
+                    d = _parse_date(value, self.settings.date_format) if value else None
+                    if d is None or d.date() != (self.now + timedelta(days=flt.days)).date():
+                        ok = False
             if ok:
                 kept.append(combo)
         if any(isinstance(f, UnsupportedFilter) for f in query.filters):
             notes.append("alcuni filtri della entry query non sono stati interpretati, quindi non sono stati verificati")
+        for source in query.sources:
+            if source.optional and source.table not in self._excluded:
+                notes.append(f"non verificato: {source.table} è unita con LEFT JOIN, letta come inner join")
         if self._excluded:
             notes.append(f"la entry query esclude {', '.join(sorted(self._excluded))} con un LEFT JOIN e un filtro IS NULL: quel "
                          "join e quel filtro non sono stati verificati, perché i contatti generati sono considerati nuovi")
@@ -415,6 +432,17 @@ class Checker:
         table = self.package.tables[entry]
         header, rows = self.csv[entry]
         pk = table.primary_key or table.field_names
+        # Spec, step 3, "Honest checks": "The trust check on the entry query reports a column it cannot verify (an
+        # expression the generator does not understand, ...) as "not verified", with the reason, and fails only on
+        # what it can verify." Such a column holds the value the case needs when a split reads it, a placeholder
+        # otherwise; either way it is not compared.
+        unverified: set[str] = set()
+        for item in query.select:
+            f = table.field(item.target_column)
+            if f is not None and _has_unsupported(item.expr) and f.name not in unverified:
+                unverified.add(f.name)
+                notes.append(f"non verificato: {entry}.{f.name} è calcolata da un'espressione non compresa "
+                             f"({_unsupported_text(item.expr)})")
         expected: dict[tuple, dict[str, Value]] = {}
         for combo in kept:
             row: dict[str, Value] = {}
@@ -449,11 +477,15 @@ class Checker:
                            if a.wait_field is not None and a.wait_field[0].lower() == entry.lower()}
             default_email = (self.package.journey.default_email_field or "").lower()
             for f in table.fields:
-                if f.name in exp:
+                if f.name in exp or f.name in unverified:
                     continue
                 if f.name.lower() in wait_fields or (default_email and f.name.lower() == default_email):
                     continue   # a wait date or the send address the journey needs, filled although the query does not
                 v = row.get(f.name)
+                if v is not None and f.default is not None \
+                        and f.default.strip().lower().replace(" ", "") in graph.CURRENT_DATE_DEFAULTS \
+                        and self._is_date(entry, f.name, v):
+                    continue   # spec, step 3: a column defaulting to the current date accepts any date
                 allowed = {None}
                 if f.default is not None:
                     allowed.add(_normalise_default(f, f.default))
@@ -554,10 +586,11 @@ class Checker:
         details: list[str] = []
         # The same rules as the coverage (spec, "Extensions beyond the pilot"): Journey Data reads the entry row
         # as written (the lookup reads the files, i.e. the values at entry), every field of an absent row reads
-        # null, and an Update contact on such a table inserts the row.
+        # null, and an Update contact on such a table inserts the row. Step 3: the clock starts at the entry time
+        # and the exit criteria are evaluated at the end of every wait, as in the coverage.
         walker = graph.Walker(self.package.journey, self.schema, self.package.emails,
                               self.settings.case_insensitive_text, self.now, self.settings.date_format,
-                              row_fields=self.table_model.existence_tested)
+                              row_fields=self.table_model.existence_tested, entry_time=self.settings.entry_time)
         cases = {c.id: c for c in self.coverage.cases}
         scenario_of = {s.id: s for s in self.coverage.scenarios}
         has_scenario_link = any(self._scenario_key_field(name) for name in self.table_model.contact_tables)
@@ -792,6 +825,20 @@ class _Skip:
 
 
 _SKIP = _Skip()
+
+
+def _has_unsupported(expr) -> bool:
+    """True when a select expression is, or contains, an expression the generator does not understand."""
+    if isinstance(expr, SelectConcat):
+        return any(_has_unsupported(part) for part in expr.parts)
+    return isinstance(expr, SelectUnsupported)
+
+
+def _unsupported_text(expr) -> str:
+    """The text of the first expression the generator does not understand inside ``expr``."""
+    if isinstance(expr, SelectConcat):
+        return next(_unsupported_text(part) for part in expr.parts if _has_unsupported(part))
+    return expr.text
 
 
 def _sql_equal(value: Value, literal: str) -> bool:

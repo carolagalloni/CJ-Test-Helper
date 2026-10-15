@@ -467,3 +467,142 @@ Chiavi aggiunte per le estensioni oltre il pilota (spec, "Extensions beyond the 
 Il valore di `reason_contains`, e ogni elemento di `warnings_contain`, `report_contains`, `report_head_contains` e
 `testbook_contains`, può essere una lista: basta che compaia uno dei suoi testi. Si usa quando la spec fissa il
 concetto ma non la parola (per esempio il nome di un'attività oppure la sua chiave).
+
+## Estensioni del passo 3: journey che dipendono dal tempo (14 ottobre 2026)
+
+Regole della sezione della spec "Extensions for time-dependent journeys (step 3, 14 October 2026)". `model.py` è stato
+esteso in modo additivo (nuovi campi con valore di default, nessuna firma cambiata): `RelativeDate`, `Condition.relative`
+e `Condition.path`, `KIND_SMS`, `Activity.wait_offset_amount/wait_offset_unit/wait_time_of_day/wait_path/sms_asset_id/
+sms_name`, `JourneyFilter` e `Journey.exits/goals/default_mobile_field`, `Table.managed`, `TableRef.optional`,
+`DateOffsetFilter`, `ROLE_LINK`, `TableModel.aliases`, `TimelinePoint`, `Case.timeline/exit_by_criteria/validity_days/
+sms_sent`, `RandomBranch.timeline/exit_by_criteria`, `CoverageResult.exit_targets/validity_days/perishable`,
+`Settings.entry_time/min_validity_days`.
+
+### criteria.py
+
+- Un valore scritto `;<segno>;<n>;<unità>` diventa `Condition.relative` (`RelativeDate`), `value` resta com'è scritto.
+- Operatori aggiunti alla tabella `OPERATORS`: `After`, `AtOrAfter`, `Before`, `AtOrBefore` (come gli operatori di
+  ordinamento) e `IsNot` (negazione di `Is`: vero anche su null). `NotEqual` resta falso su null.
+- `evaluate_condition(cond, value, field_type, case_insensitive, now=None)`: con `relative` il riferimento è `now`
+  spostato dal valore relativo (`shift_date`); confronto sulla data per days/weeks/months/years, su data e ora per
+  hours/minutes. `now` mancante con un valore relativo -> `UnsupportedOperator`. Helper pubblici: `shift_date(moment,
+  rel)`, `relative_units()`, `is_day_level(rel)`.
+- `Condition.path` come lo scrive criteria.py contiene gli ID delle relazioni (`groupToSetRelationshipId` di `UiMetaData`,
+  poi i `RelationshipID` degli `<AttributePath>`); loader.py li sostituisce con i nomi delle tabelle sul percorso.
+
+### loader.py
+
+- `SMSSYNC` -> `KIND_SMS` (`sms_asset_id`, `sms_name`); non è più un tipo sconosciuto.
+- Wait by attribute: `wait_offset_amount/unit` da `waitDuration/waitUnit` (anche negativi), `wait_time_of_day` da
+  `specifiedTime`, `wait_path` dai segmenti dell'espressione tra `Contact.Attribute` e il set del campo. Un WAIT senza
+  `metaData.uiType` viene riconosciuto dall'espressione o dal prefisso della chiave.
+- `Condition.path`: dagli ID delle relazioni ai nomi delle tabelle tra il contatto e la tabella della condizione (dalla
+  più vicina al contatto, esclusa la tabella della condizione).
+- Exit criteria e goal: `Journey.exits` e `Journey.goals` (`JourneyFilter` con la formula mappata come quella di uno
+  split e `unsupported_reason` con le stesse regole). Warning: criteri valutati alla fine di ogni wait quando sono tutti
+  supportati; "non modellati, perché ..." altrimenti. I goal restano non modellati.
+- `Journey.default_mobile_field` da `defaults.mobileNumber`, come `default_email_field`.
+- Condizione con valore relativo su un campo non Date, o con unità non supportata -> branch non supportato.
+- `Table.managed` dalle issue `NO_DEPLOY` / `ManagedDataExtension`, con un warning.
+
+### sqlparse_lite.py
+
+- `DateOffsetFilter(column, days)` per `CAST(col AS DATE) = CAST(DATEADD(day, N, GETDATE()) AS DATE)` e le varianti
+  della spec; solo l'uguaglianza. `TableRef.optional` per LEFT/RIGHT/FULL JOIN (letti come inner join, con warning).
+- Pattern sospetto: due colonne della stessa tabella scambiate di nome nella SELECT.
+
+### tables.py
+
+- Tabelle di collegamento (`ROLE_LINK`): ogni tabella di `Condition.path` e di `Activity.wait_path` è selezionata, con
+  il motivo "sul percorso tra il contatto e <tabella> letta da <attività>". Senza percorso nell'export, una tabella
+  letta e non collegata prende la catena di relazioni più corta dalle tabelle collegate al contatto (warning); senza
+  catena vale la regola di prima (riga condivisa, assunzione).
+- `TableModel.aliases`: gruppi di campi non chiave che una query seguita copia come colonna semplice (`SELECT M.X` nella
+  tabella di ingresso): stessa variabile per la coverage. Le copie di campi chiave restano nei `key_groups`.
+- Una sorgente `optional` resta selezionata; il motivo cita il LEFT JOIN. Una tabella `managed` resta selezionata; il
+  motivo dice che la tabella è sincronizzata dal CRM e che il CSV si importa come gli altri. `DateOffsetFilter` non è un campo di attivazione.
+
+### graph.py
+
+- `WalkState.clock` (parte da `entry_time`, che `Walker` riceve; default l'ora di generazione), `WalkState.timeline`
+  (un `TimelinePoint` per `Step`, stesso ordine), `WalkState.sms_sent`, `WalkState.exit_by_criteria`,
+  `STOP_EXIT_CRITERIA`.
+- Decision split ed exit criteria valutano con `now = state.clock` (`graph.evaluate(..., now=)`).
+- Wait by duration: `clock += durata` (`WAIT_UNIT_MINUTES`). Wait by attribute: valore del campo dal lookup (Contact
+  Data con le scritture, Journey Data dalla fotografia); se UNKNOWN e il campo è nei domini della coverage ->
+  `STOP_UNDETERMINED` con `pending_field`; se UNKNOWN e nessuna condizione lo legge (campo "solo wait") il wait finisce
+  subito (il valore lo scrive datagen con la regola delle date dei wait); null -> finisce subito (assunzione); altrimenti
+  `clock = max(clock, wait_end(activity, data))` dove `wait_end` applica l'offset (`shift_date` con l'unità del wait) e
+  `wait_time_of_day` quando c'è. Send-time wait: `+0`.
+- Alla fine di ogni wait: gli exit criteria supportati vengono valutati con il clock; se uno è vero il percorso finisce
+  lì (`Step(wait, None)`, `exit_by_criteria = wait`, `STOP_EXIT_CRITERIA`); UNKNOWN -> `STOP_UNDETERMINED` sul campo.
+- Email e SMS registrati con il clock (`emails_sent`, `sms_sent`); `{{DateTime.Now}}` scritto da un Update contact
+  vale il clock.
+- Helper pubblici: `wait_end(activity, value: datetime) -> datetime`, `fixed_delays(journey) -> dict[str, set[float]]`
+  (per ogni attività, le somme in giorni dei wait by duration su ogni percorso dall'inizio; i wait by attribute e STO
+  contano 0; al massimo 32 valori per attività, con warning).
+
+### coverage.py
+
+- Campi: anche quelli letti dagli exit criteria supportati e i campi dei wait by attribute che una condizione legge.
+  Alias (`TableModel.aliases`): ogni gruppo è una variabile, rappresentata dal campo della tabella sorgente (non la
+  copia di ingresso); il lookup del walker risolve gli alias.
+- Dominio di un campo Date con condizioni relative o con un wait con offset: punti di taglio in giorni = `{n + W}` per
+  ogni condizione relativa e `{-O + W}` per ogni wait con offset `O`, con `W` i ritardi fissi con cui si arriva
+  all'attività (`graph.fixed_delays`); candidati = `T0` spostato di ogni punto di taglio e di ogni punto ±1 e ±2 giorni
+  (ora del giorno di `T0`), più i valori assoluti nominati, più null se ammesso; i candidati con lo stesso vettore di
+  verità su ogni (condizione, W) sono una classe. Validità di un candidato: il numero di giorni interi di cui si
+  può spostare in avanti l'ora di ingresso prima che un vettore di verità cambi, calcolata rivalutando le
+  condizioni con l'ingresso spostato di 1, 2, ... giorni (fino a 366: oltre, il valore non è deperibile e la
+  validità è None). Per ogni classe resta un candidato, scelto in quest'ordine: (1) validità ≥
+  `Settings.min_validity_days` (tutti, se nessuno la raggiunge); (2) il wait by attribute sul campo finisce prima
+  (solo quando un wait con offset legge il campo); (3) non su un punto di taglio; (4) validità più lunga;
+  (5) data più vicina; null non rappresenta mai una classe che ha un membro non null. `Case.validity_days` è None
+  quando nessun valore del caso è deperibile. I campi "solo wait" senza condizioni restano fuori dalla coverage,
+  come prima.
+- Target "exit criteria met": un bit per ogni exit criterion supportato nel set cover (`exit_targets`,
+  `activity_key` = chiave del criterio, `outcome_key` = `"met"`, `activity_kind` = `"exit"`), coperto dai casi con
+  `exit_by_criteria`.
+- `Case.timeline`, `exit_by_criteria`, `sms_sent` dalla foglia; `Case.validity_days` = minimo dei margini dei valori
+  del caso che ne hanno uno; `CoverageResult.validity_days` = minimo sui casi; `perishable` lo spiega.
+- Motivi dei branch non coperti: nuova classe "tutti i contatti che arrivano alla fine di <wait> escono per i criteri
+  di uscita (<descrizione>)".
+
+### datagen.py
+
+- Alias: il valore del rappresentante viene scritto in ogni membro (le copie di ingresso arrivano comunque dalla
+  SELECT). Una colonna di ingresso letta da uno split e calcolata da una `SelectUnsupported` prende il valore del
+  caso, con una nota invece di un placeholder.
+- `DateOffsetFilter`: ora di generazione spostata di `days`. Campi "solo wait": regola di prima; le scadenze delle
+  finestre manuali usano `graph.wait_end`.
+- SMS: nei casi con `sms_sent`, il primo contatto riceve `settings.real_phone` nella colonna
+  `journey.default_mobile_field` della tabella di ingresso e nel campo sorgente da cui la SELECT la copia
+  (`Contact.uses_real_phone`); senza numero reale, `fake_phone` e un warning.
+- Le tabelle `managed` ricevono comunque il CSV; `GeneratedData.warnings` lo dice.
+
+### checks.py
+
+- Il walker della simulazione riceve lo stesso `entry_time` e valuta gli exit criteria: un percorso che esce per i
+  criteri finisce con `Step(wait, None)`, come nella coverage.
+- Check della entry query: `DateOffsetFilter` verificato sulla parte data; una colonna letta da uno split e calcolata da
+  un'espressione non compresa è "non verificata" (nota, non errore); un default `GetDate()` ammette qualsiasi data;
+  una sorgente `optional` è una nota.
+
+### outputs.py e app.py
+
+- report.md: nel blocco "Attenzione" la scadenza di attivazione quando `validity_days` non è None; sezione "Criteri di
+  uscita" (descrizione, modellati o no, casi che escono, stato del target); le tabelle di collegamento e la nota
+  sulle data extension sincronizzate (il loro CSV è tra quelli da importare) nella sezione Tabelle e in "Come eseguire i test"; i valori deperibili tra i warning.
+- testbook.xlsx: nei passi la timeline ("Giorno N (data e ora): ..."), il passo dell'SMS e il suo risultato atteso,
+  l'uscita per i criteri nel risultato atteso, la scadenza di attivazione nelle Note, la nota che dice che un branch è
+  deciso sull'estremo di un confronto sul giorno.
+- app.py: impostazione "Validità minima dei dati (giorni)"; la scadenza di attivazione nel riepilogo; gli exit
+  criteria nel passo di revisione. `scenarios.csv` non cambia.
+
+### Esempi del passo 3: chiavi aggiunte a expected.json
+
+Lette da `tests/test_examples.py` (`compare_step3`, `case_matches_step3`): `table_roles` (tabella -> ruoli che deve
+avere), `csv_rows` (tabella -> numero di righe del CSV), `csv_values` ("Tabella.Campo" -> insieme dei valori distinti,
+null compreso), `exit_targets` ("CHIAVE/met" -> {status, reason_contains}), `validity_days` (numero o null); per
+caso: `exit_by_criteria`, `sms_sent`, `validity_days`, `timeline` (attività -> "YYYY-MM-DD HH:MM"),
+`contact_values_any_of`, `contact_rows` (una voce per contatto, in ordine di chiave: "Tabella.Campo" -> valore).

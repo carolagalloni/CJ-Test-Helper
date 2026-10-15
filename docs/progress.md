@@ -1,6 +1,26 @@
 # Avanzamento
 
-Si riparte da questo file. Spec: `docs/spec.md`. Contratto: `docs/plan.md`.
+Si riparte da questo file. Spec: `docs/spec.md`. Contratto: `docs/plan.md`. Disegno del passo 3: `docs/design-passo3.md`.
+
+## Ripartenza del passo 3 (journey che dipendono dal tempo): stato al checkpoint del 14 ottobre 2026, sera
+
+Passo 3 consegnato: il generatore gira sui sei export della famiglia RET_99 (2W, 3m, 4W, HC, 5d, 6w; dati del cliente,
+MAI nel repository), sul pilota (CSV e `scenarios.csv` identici byte per byte) e sui quattro export del passo 2 (stessi
+numeri e stessi stati di prima). Report finale del passo: `docs/final-report-passo3.md`. Regole: sezione della spec
+"Extensions for time-dependent journeys (step 3, 14 October 2026)"; contratti: `docs/plan.md`, "Estensioni del passo
+3"; perché: `docs/design-passo3.md`; assunzioni 47-61: `docs/assumptions.md`.
+
+Materiale fuori dal repository (da ricaricare in una sessione nuova): i sei export RET_99 e i quattro del passo 2, le
+risposte attese derivate a mano per cinque dei sei export (`target_<nome>.json`, derivate da un agente, senza il passo
+di confutazione per restare nel budget). Gli script `tools/dump_cj.py`, `tools/graph_cj.py` e `tools/run_cohort.py`
+ricostruiscono dumps, grafi, baseline e confronto (`CJ_SCRATCH`, `CJ_RUNS`, `CJ_REPO` nell'ambiente).
+
+Risposte del team del 14 ottobre sera applicate (`docs/final-report-passo3.md`, "Risposte del team"): date relative sul giorno confermate, data extension sincronizzate importate come gli altri CSV, validità sul valore, target dei criteri di uscita coperto, errore del journey 4 settimane segnalato al cliente.
+
+Suite: ~1000 test, 79 esempi (64 dei passi 1 e 2, 15 del passo 3), pilota: tutto verde. Prossimi passi possibili, da
+decidere con l'utente: le domande in `docs/final-report-passo3.md`; la validità misurata sul percorso del caso (oggi
+è misurata sul valore, lettura prudente); il set cover che sui sei export usa da 1 a 2 casi più del minimo derivato
+a mano; la verifica delle assunzioni 47-61 con un run reale.
 
 ## Fatto
 

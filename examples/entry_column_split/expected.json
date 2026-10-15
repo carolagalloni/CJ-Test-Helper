@@ -13,7 +13,7 @@
   "case_count": {"min": 2, "max": 2},
   "contact_count": 6,
   "cases": [
-    {"contact_values": {"DE_Entry.Segment": "Gold"}, "end_activity": "UPDATE-1", "manual_actions": [], "contact_count": 3},
+    {"contact_values": {"DE_Master.Segment": "Gold"}, "end_activity": "UPDATE-1", "manual_actions": [], "contact_count": 3},
     {"end_activity": "UPDATE-3", "manual_actions": [], "contact_count": 3}
   ],
   "unsupported": [],

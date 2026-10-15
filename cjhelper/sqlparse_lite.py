@@ -9,19 +9,27 @@ What is understood (docs/plan.md, "sqlparse_lite.py"):
 
 - Sources: the FROM table and every JOIN table, written ``[Name]``, ``ENT.[Name]`` or
   ``Name``, with or without an alias. Table names arrive already resolved by the loader.
+  A source whose row may be absent because of an outer join (the table a LEFT JOIN adds,
+  the tables before a RIGHT JOIN, both sides of a FULL JOIN) is ``optional``; it is still
+  read as an inner join, with a warning (spec, step 3: "A LEFT JOIN source still gets one row
+  per contact (read as an inner join, as before)").
 - Joins: ``column = column`` equalities in ON clauses, chained with AND.
 - Filters: the WHERE clause split on top-level AND (parentheses around AND groups are
   flattened). ``column = literal`` on either side, ``column IS [NOT] NULL``, and comparisons
   between the current date and a column (``now >= column`` is a start bound, ``now <= column``
   an end bound, whichever side the column is on). ``now BETWEEN a AND b`` counts as both.
+  An equality between the date part of a column and the current date moved by a whole number
+  of days is a ``DateOffsetFilter`` (spec, step 3, "Columns the entry query derives and columns
+  it copies"), see ``_match_date_offset``.
 - Select: a column, a string or number literal, the current date (bare or with
   ``AT TIME ZONE``), ``FORMAT(<current date>, '<.NET format>')`` and ``CONCAT`` of these.
-  ``SELECT *`` sets ``select_all``.
+  ``SELECT *`` sets ``select_all``. Two columns of one table copied into each other's names
+  (``M.Phone AS MobilePhone, M.MobilePhone AS Phone``) are read as written, with a warning.
 
 The current date is ``GETDATE()``, ``GETUTCDATE()`` or ``SYSDATETIME()``; sqlglot reads
 ``CURRENT_TIMESTAMP`` exactly like ``GETDATE()``, so it is accepted too. In WHERE it may sit
 inside ``CAST(... AS DATE)`` (or ``CONVERT(DATE, ...)``, or a DATETIME type) and ``AT TIME ZONE``.
-Time zones are not kept: ``DateBoundFilter`` and ``SelectCurrentDate`` carry none.
+Time zones are not kept: ``DateBoundFilter``, ``DateOffsetFilter`` and ``SelectCurrentDate`` carry none.
 
 Nothing is guessed: whatever is not understood becomes an ``UnsupportedFilter``, a
 ``SelectUnsupported`` or a join left out, and every such case is also written in plain words
@@ -31,7 +39,7 @@ in ``ParsedQuery.warnings``. ``parse_query`` never raises on odd SQL.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional
 
 import sqlglot
@@ -41,6 +49,7 @@ from sqlglot.dialects.tsql import TSQL
 from cjhelper.model import (
     ColumnRef,
     DateBoundFilter,
+    DateOffsetFilter,
     EqualityFilter,
     Filter,
     IsNullFilter,
@@ -73,6 +82,32 @@ _DATE_TYPES = (
     exp.DataType.Type.DATETIME2,
     exp.DataType.Type.SMALLDATETIME,
 )
+
+# DATEADD units that move a date by whole days, in days per unit, as sqlglot names them: it writes day, dd and d
+# as DAY and week, wk and ww as WEEK, and keeps the other abbreviations. T-SQL's DATEADD gives dayofyear (dy, y)
+# and weekday (dw, w) the meaning of day ("dayofyear, day, and weekday return the same value"). Month, quarter and
+# year move a date by a number of days that depends on the date: not understood.
+_DAY_UNITS = {
+    "DAY": 1,
+    "DAYOFYEAR": 1, "DY": 1, "Y": 1,
+    "WEEKDAY": 1, "DW": 1, "W": 1,
+    "WEEK": 7,
+}
+
+# DATEADD units shorter than a day, in seconds. They are understood on a date that keeps its time (GETDATE()),
+# when the moves add up to whole days before the date part is taken; T-SQL refuses them on a DATE.
+_TIME_UNITS = {
+    "HOUR": 3600, "HH": 3600,
+    "MINUTE": 60, "MI": 60, "N": 60,
+    "SECOND": 1, "SS": 1, "S": 1,
+}
+
+_SECONDS_PER_DAY = 86400
+
+# DATEADD takes an int amount; a date moved farther than the span of a T-SQL DATE (0001-01-01 to 9999-12-31)
+# makes the query fail, so such a filter is not understood.
+_INT_RANGE = (-2**31, 2**31 - 1)
+_MAX_DAY_OFFSET = 3_652_058
 
 # Parts of a SELECT this module reads. Any other part present is reported as ignored.
 _READ_PARTS = ("expressions", "from_", "joins", "where")
@@ -391,20 +426,27 @@ def _warn_ignored_parts(select: exp.Select, context: _Context) -> None:
 # ---------------------------------------------------------------------------
 
 def _read_sources(select: exp.Select, context: _Context) -> None:
-    """Spec: source tables are "any table in the FROM or JOIN", with their aliases."""
+    """Spec: source tables are "any table in the FROM or JOIN", with their aliases.
+
+    A source whose row may be absent because of an outer join is ``optional`` (spec, step 3, "A LEFT JOIN
+    source still gets one row per contact (read as an inner join, as before); the report says so"): the table
+    a LEFT JOIN adds, every table before a RIGHT JOIN, and both sides of a FULL JOIN."""
     from_clause = select.args.get("from_")
-    nodes = [from_clause.this] if from_clause is not None else []
-    nodes += [join.this for join in select.args.get("joins") or []]
-    for node in nodes:
-        _add_source(node, context)
+    if from_clause is not None:
+        _add_source(from_clause.this, context, optional=False)
+    for join in select.args.get("joins") or []:
+        side = str(join.side or "").upper()
+        if side in ("RIGHT", "FULL"):
+            context.sources[:] = [replace(source, optional=True) for source in context.sources]
+        _add_source(join.this, context, optional=side in ("LEFT", "FULL"))
 
 
-def _add_source(node: exp.Expression, context: _Context) -> None:
+def _add_source(node: exp.Expression, context: _Context, optional: bool) -> None:
     if not _is_table(node):
         context.warn(f"{_sql(node)} nel FROM/JOIN non è una tabella e non è stato letto")
         return
     name = _canonical_table_name(node.name, context.tables)
-    context.sources.append(TableRef(name, node.alias or None))
+    context.sources.append(TableRef(name, node.alias or None, optional))
     if node.catalog or (node.db and node.db.upper() != _SHARED_PREFIX):
         context.warn(f"il prefisso della tabella {name} è ignorato: {_sql(node)}")
     if node.args.get("pivots"):
@@ -514,6 +556,10 @@ def _read_filter(part: exp.Expression, context: _Context) -> list[Filter]:
     if equality is not None:
         column, value = equality
         return [EqualityFilter(context.resolve(column), value)]
+    offset = _match_date_offset(part)
+    if offset is not None:
+        column, days = offset
+        return [DateOffsetFilter(context.resolve(column), days)]
     bound = _match_date_bound(part)
     if bound is not None:
         column, which = bound
@@ -588,6 +634,137 @@ def _match_date_range(node: exp.Expression) -> Optional[tuple[exp.Column, exp.Co
     return start, end
 
 
+@dataclass(frozen=True)
+class _Moment:
+    """What a date expression in a WHERE equality stands for: a column (``column`` None: the current date)
+    moved by ``seconds``, either with its time of day or, when ``date_only``, as its date part (time 00:00).
+    A ``date_only`` moment is always moved by whole days."""
+
+    column: Optional[exp.Column]
+    seconds: int
+    date_only: bool
+
+
+def _match_date_offset(node: exp.Expression) -> Optional[tuple[exp.Column, int]]:
+    """Spec, step 3: "A filter comparing the date part of a column with the current date moved by a number of
+    days (``CAST(CM.CreatedDate AS DATE) = CAST(DATEADD(day, -1, GETDATE()) AS DATE)``) is understood [...] The
+    spelling with the current date cast first (``DATEADD(day, -2, CAST(GETDATE() AS DATE))``) is the same filter."
+
+    Returns the column and the number of days when ``node`` is an equality, either way round, between the date
+    part of a column and the date part of the current date moved by whole days, else None. The meaning decides,
+    not the spelling (see ``_moment``): ``CAST(GETDATE() AS DATE)`` is 0 days, a week is 7 days, 48 hours taken
+    before the date part are 2 days, and a column moved by days is moved back onto the other side. Both sides
+    must be date parts: T-SQL compares ``CM.CreatedDate = CAST(GETDATE() AS DATE)`` with the full date and time
+    (true only at midnight), so it stays unsupported. Only ``=``: an inequality against a moved date is not
+    understood, and a comparison with the current date unmoved is a ``DateBoundFilter``."""
+    if not isinstance(node, exp.EQ):
+        return None
+    try:
+        left, right = _moment(node.this), _moment(node.expression)
+    except RecursionError:  # an absurdly deep expression (thousands of nested terms) is not understood
+        return None
+    if left is None or right is None:
+        return None
+    for column_side, now_side in ((left, right), (right, left)):
+        if column_side.column is None or now_side.column is not None:
+            continue
+        if not (column_side.date_only and now_side.date_only):
+            return None
+        seconds = now_side.seconds - column_side.seconds
+        if seconds % _SECONDS_PER_DAY:
+            return None
+        days = seconds // _SECONDS_PER_DAY
+        if abs(days) > _MAX_DAY_OFFSET:
+            return None
+        return column_side.column, days
+    return None
+
+
+def _moment(node: Optional[exp.Expression]) -> Optional[_Moment]:
+    """Read a column or the current date under casts and ``DATEADD``; None for anything else.
+
+    - ``GETDATE()`` and the other current-date calls, or a plain column: the value with its time.
+    - ``CAST(x AS DATE)`` / ``CONVERT(DATE, x)``: the date part of ``x``, when ``x`` is moved by whole days
+      (the date part of a value moved by 12 hours depends on the time of day: not understood).
+    - A cast to DATETIME or DATETIME2 keeps the value; SMALLDATETIME rounds the time to the minute, so it is
+      understood only on a date part.
+    - ``DATEADD(unit, n, x)`` with ``n`` a whole number (``_whole_number``): ``x`` moved by ``n`` units, for
+      the units of ``_DAY_UNITS``, and of ``_TIME_UNITS`` when ``x`` keeps its time.
+    - Parentheses and ``AT TIME ZONE`` are passed through (time zones are not kept, as for the date bounds).
+    """
+    while isinstance(node, (exp.Paren, exp.AtTimeZone)):
+        node = node.this
+    if _is_current_date_call(node):
+        return _Moment(None, 0, False)
+    if _is_plain_column(node):
+        return _Moment(node, 0, False)
+    cast = _cast_parts(node)
+    if cast is not None:
+        to_type, operand = cast
+        inner = _moment(operand)
+        if inner is None:
+            return None
+        if to_type == exp.DataType.Type.DATE:
+            if inner.date_only:
+                return inner
+            if inner.seconds % _SECONDS_PER_DAY:
+                return None
+            return _Moment(inner.column, inner.seconds, True)
+        if to_type in (exp.DataType.Type.DATETIME, exp.DataType.Type.DATETIME2):
+            return inner
+        if to_type == exp.DataType.Type.SMALLDATETIME and inner.date_only:
+            return inner
+        return None
+    if isinstance(node, exp.DateAdd):
+        amount = _whole_number(node.expression)
+        inner = _moment(node.this)
+        if amount is None or inner is None or not _INT_RANGE[0] <= amount <= _INT_RANGE[1]:
+            return None
+        unit = node.text("unit").upper()
+        if unit in _DAY_UNITS:
+            delta = amount * _DAY_UNITS[unit] * _SECONDS_PER_DAY
+        elif unit in _TIME_UNITS and not inner.date_only:
+            delta = amount * _TIME_UNITS[unit]
+        else:
+            return None
+        return _Moment(inner.column, inner.seconds + delta, inner.date_only)
+    return None
+
+
+def _cast_parts(node: Optional[exp.Expression]) -> Optional[tuple[exp.DataType.Type, exp.Expression]]:
+    """``CAST(x AS type)`` (TRY_CAST too) or ``CONVERT(type, x[, style])`` -> (type, x), else None."""
+    if isinstance(node, exp.Cast) and node.to is not None:
+        return node.to.this, node.this
+    if isinstance(node, exp.Convert) and isinstance(node.this, exp.DataType):
+        return node.this.this, node.expression
+    return None
+
+
+# A whole number as written in SQL: digits only (1.5 and 1e3 are not whole numbers here).
+_DIGITS = re.compile(r"[0-9]+")
+
+
+def _whole_number(node: Optional[exp.Expression]) -> Optional[int]:
+    """The value of a whole-number constant: a number literal, with parentheses, signs and ``+``, ``-``, ``*``
+    between such constants (``-1``, ``(-1) * 7``). None for anything else, a column or a decimal included."""
+    node = _without_parens(node)
+    if isinstance(node, exp.Literal) and not node.is_string:
+        return int(node.this) if _DIGITS.fullmatch(node.this) else None
+    if isinstance(node, exp.Neg):
+        value = _whole_number(node.this)
+        return None if value is None else -value
+    if isinstance(node, (exp.Add, exp.Sub, exp.Mul)):
+        left, right = _whole_number(node.this), _whole_number(node.expression)
+        if left is None or right is None:
+            return None
+        if isinstance(node, exp.Add):
+            return left + right
+        if isinstance(node, exp.Sub):
+            return left - right
+        return left * right
+    return None
+
+
 def _and_parts(condition: exp.Expression) -> list[exp.Expression]:
     """The parts of a condition chained with AND, in order, with no parentheses around them.
 
@@ -624,6 +801,28 @@ def _read_select_list(select: exp.Select, context: _Context, result: ParsedQuery
             if not target:
                 context.warn(f"l'elemento della SELECT {_sql(item)} non ha un nome di colonna")
             result.select.append(SelectItem(target, _select_expr(node, target, context)))
+    _warn_swapped_columns(result.select, context)
+
+
+def _warn_swapped_columns(items: list[SelectItem], context: _Context) -> None:
+    """Two plain columns of one table copied into each other's names (``M.Phone AS MobilePhone,
+    M.MobilePhone AS Phone``) are read as written, but the pattern looks like a slip: one warning per pair,
+    naming the first item's column (X) and target (Y). Names are compared ignoring letter case."""
+    copies: dict[tuple[str, str, str], tuple[str, str]] = {}
+    for item in items:
+        if not isinstance(item.expr, SelectColumn) or not item.expr.source.table or not item.target_column:
+            continue
+        table, column, target = item.expr.source.table, item.expr.source.column, item.target_column
+        if column.lower() == target.lower():
+            continue
+        mirror = copies.get((table, target.lower(), column.lower()))
+        if mirror is not None:
+            first_column, first_target = mirror
+            context.warn(
+                f"la query copia {first_column} in {first_target} e {first_target} in {first_column}: "
+                f"verifica che lo scambio sia voluto"
+            )
+        copies.setdefault((table, column.lower(), target.lower()), (column, target))
 
 
 def _target_and_expression(item: exp.Expression) -> tuple[str, exp.Expression]:

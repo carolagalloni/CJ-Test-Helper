@@ -1,0 +1,29 @@
+{
+  "journey_name": "EX_CaseWhenIdentifier",
+  "activity_count": 3,
+  "csv_tables": ["DE_Entry", "DE_Master", "DE_Backup"],
+  "table_levels": {"DE_Entry": "contact", "DE_Master": "contact", "DE_Backup": "contact"},
+  "table_roles": {"DE_Entry": ["entry"], "DE_Backup": ["source"]},
+  "branches": {
+    "SPLIT-1/path_a": {"status": "covered"},
+    "SPLIT-1/remainder_path": {"status": "covered"}
+  },
+  "scenario_count": {"min": 1, "max": 1},
+  "case_count": {"min": 2, "max": 2},
+  "contact_count": 6,
+  "cases": [
+    {"contact_values": {"DE_Entry.Email_Identifier": "False"}, "has_row": {"DE_Backup": true},
+     "end_activity": "UPDATE-1", "manual_actions": [], "contact_count": 3},
+    {"contact_values": {"DE_Entry.Email_Identifier": "True"}, "has_row": {"DE_Backup": true},
+     "end_activity": "UPDATE-2", "manual_actions": [], "contact_count": 3}
+  ],
+  "unsupported": [],
+  "checks_pass": true,
+  "csv_no_space_cells": true,
+  "report_contains": ["Email_Identifier", "import diretto", "LEFT JOIN", ["non verificat", "not verified"]],
+  "csv_rows": {"DE_Entry": 6, "DE_Master": 6, "DE_Backup": 6},
+  "csv_values": {
+    "DE_Entry.Email_Identifier": ["False", "True"],
+    "DE_Backup.Email_Timestamp": ["2026-10-11 12:00"]
+  }
+}

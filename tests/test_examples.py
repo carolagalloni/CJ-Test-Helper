@@ -113,9 +113,52 @@ def compare_texts(result, expected: dict, all_warnings: str, problems: list[str]
                         problems.append(f"{name}: a cell holds only spaces ({cell!r})")
 
 
+def compare_step3(result, expected: dict, problems: list[str]) -> None:
+    """Keys added for the step 3 examples (docs/plan.md, "Esempi"): table roles, CSV row counts and column
+    values, the exit-criteria coverage targets and the validity of the data."""
+    cov = result.coverage
+    for table, roles in (expected.get("table_roles") or {}).items():
+        role = result.table_model.tables.get(table)
+        if role is None:
+            problems.append(f"table {table}: not in the export")
+            continue
+        missing = [r for r in roles if r not in role.roles]
+        if missing:
+            problems.append(f"table {table}: roles {sorted(role.roles)} lack {missing}")
+    for table, count in (expected.get("csv_rows") or {}).items():
+        data = result.data.tables.get(table)
+        got = len(data.rows) if data is not None else None
+        if got != count:
+            problems.append(f"{table}.csv has {got} rows, expected {count}")
+    for ref, values in (expected.get("csv_values") or {}).items():
+        table, field_name = ref.split(".", 1)
+        data = result.data.tables.get(table)
+        if data is None:
+            problems.append(f"csv_values {ref}: no CSV for {table}")
+            continue
+        got = {row.get(field_name) for row in data.rows}
+        if got != set(values):
+            problems.append(f"{ref}: distinct values {sorted(map(str, got))} != {sorted(map(str, values))}")
+    targets = {f"{b.activity_key}/{b.outcome_key}": b for b in getattr(cov, "exit_targets", [])}
+    for key, exp in (expected.get("exit_targets") or {}).items():
+        target = targets.get(key)
+        if target is None:
+            problems.append(f"exit target {key}: not produced (have {sorted(targets)})")
+            continue
+        if target.status != exp.get("status"):
+            problems.append(f"exit target {key}: status {target.status!r} != {exp.get('status')!r} (reason: {target.reason})")
+        if exp.get("reason_contains") and not contains(target.reason, exp["reason_contains"]):
+            problems.append(f"exit target {key}: reason {target.reason!r} does not contain {exp['reason_contains']!r}")
+    if "validity_days" in expected:
+        got = getattr(cov, "validity_days", None)
+        if got != expected["validity_days"]:
+            problems.append(f"validity_days {got} != {expected['validity_days']}")
+
+
 def compare(result, expected: dict) -> list[str]:
     problems: list[str] = []
     cov = result.coverage
+    compare_step3(result, expected, problems)
     if "journey_name" in expected and result.package.journey.name != expected["journey_name"]:
         problems.append(f"journey name {result.package.journey.name!r} != {expected['journey_name']!r}")
     if "activity_count" in expected and result.package.journey.activity_count != expected["activity_count"]:
@@ -190,6 +233,8 @@ def case_matches(result, case, scenario, want) -> bool:
             return False
     if "emails_sent" in want and case.emails_sent != want["emails_sent"]:
         return False
+    if not case_matches_step3(result, case, want):
+        return False
     if "random" in want:
         r = want["random"]
         if case.random is None:
@@ -200,6 +245,40 @@ def case_matches(result, case, scenario, want) -> bool:
             return False
         if "expected_high" in r and case.random.expected_high != r["expected_high"]:
             return False
+    return True
+
+
+def case_matches_step3(result, case, want) -> bool:
+    """Case keys added for step 3: `exit_by_criteria` (the wait at whose end the contact leaves, or null),
+    `sms_sent` (SMS activity keys in order), `validity_days`, `timeline` ({activity key: "YYYY-MM-DD HH:MM"},
+    the clock at that step), `contact_values_any_of` ({field: [allowed values]}) and `contact_rows` (one dict
+    per contact, in key order, {"Table.Field": value} read from that contact's CSV row)."""
+    if "exit_by_criteria" in want and getattr(case, "exit_by_criteria", None) != want["exit_by_criteria"]:
+        return False
+    if "sms_sent" in want and list(getattr(case, "sms_sent", [])) != want["sms_sent"]:
+        return False
+    if "validity_days" in want and getattr(case, "validity_days", None) != want["validity_days"]:
+        return False
+    if want.get("timeline"):
+        points = {p.activity_key: p.at for p in getattr(case, "timeline", [])}
+        for key, at in want["timeline"].items():
+            if key not in points or points[key].strftime("%Y-%m-%d %H:%M") != at:
+                return False
+    for k, allowed in (want.get("contact_values_any_of") or {}).items():
+        t, f = k.split(".", 1)
+        if case.contact_values.get((t, f)) not in allowed:
+            return False
+    if "contact_rows" in want:
+        rows = want["contact_rows"]
+        if len(case.contact_keys) != len(rows):
+            return False
+        for key, wanted in zip(case.contact_keys, rows):
+            for ref, v in wanted.items():
+                t, f = ref.split(".", 1)
+                data = result.data.tables.get(t)
+                row = next((r for r in (data.rows if data is not None else []) if key in r.values()), None)
+                if row is None or row.get(f) != v:
+                    return False
     return True
 
 

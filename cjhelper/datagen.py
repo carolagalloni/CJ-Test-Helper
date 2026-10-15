@@ -17,10 +17,20 @@ each contact, and a requirement on an entry column (a key, a split value, a wait
 back onto the source column that the select copies into it.
 
 Phone numbers. The spec gives one contact per case the tester's real number "in each case whose
-path sends a message to a phone". None of the activity types supported by the PoC sends to a phone
-(the pilot's SMS steps are update-contact placeholders), so every phone field gets
-``Settings.fake_phone`` and ``Contact.uses_real_phone`` is always False. ``_uses_real_phone`` is
-the hook to change when an SMS activity type is supported.
+path sends a message to a phone". An SMS send (step 3, "SMS sends") goes to the entry column the journey
+names as its default mobile number: in a case with ``Case.sms_sent`` and a real number in the settings, the
+first contact gets that number in this column and in the source column the entry SELECT copies it from
+(``Contact.uses_real_phone``). Every other phone field, and the other contacts, get ``Settings.fake_phone``.
+
+Spec, step 3 ("Columns the entry query derives and columns it copies", "Synchronized data extensions"):
+
+- The fields of an alias group (``TableModel.aliases``) hold one value: the one the coverage gives to the
+  group's representative is written into every member, the entry copies included (they come from the SELECT).
+- An entry column that a split reads and that the entry query computes with an expression the generator does
+  not understand takes the value the case needs (rule 2), with a warning instead of a placeholder.
+- A filter on the date part moved by a number of days gives the generation time moved by that number of days.
+- A managed (synchronized) data extension keeps its CSV; a note says it is synchronized from the CRM, so its
+  rows will also arrive from the sync.
 
 Spec, "Extensions beyond the pilot":
 
@@ -46,7 +56,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Optional
 
-from .graph import CURRENT_DATE_DEFAULTS, case_paths, fixed_wait_minutes
+from .criteria import UnsupportedOperator
+from .graph import CURRENT_DATE_DEFAULTS, case_paths, fixed_wait_minutes, wait_end
 from .model import (
     ENTRY_AUTOMATION,
     ENTRY_RUN_ONCE,
@@ -63,6 +74,7 @@ from .model import (
     Contact,
     CoverageResult,
     DateBoundFilter,
+    DateOffsetFilter,
     EqualityFilter,
     Field,
     FieldRef,
@@ -294,6 +306,13 @@ def _count(number: int, singular: str, plural: str) -> str:
     return f"{number} {singular}" if number == 1 else f"{number} {plural}"
 
 
+def _has_unsupported(expr: object) -> bool:
+    """True when a select expression is, or contains, an expression the generator does not understand."""
+    if isinstance(expr, SelectConcat):
+        return any(_has_unsupported(part) for part in expr.parts)
+    return isinstance(expr, SelectUnsupported)
+
+
 _DOTNET_TOKENS = {"yyyy": "%Y", "MM": "%m", "dd": "%d", "HH": "%H", "mm": "%M", "ss": "%S"}
 _DOTNET_PATTERN = re.compile("yyyy|MM|dd|HH|mm|ss")
 
@@ -468,12 +487,18 @@ class _Generator:
         self._key_group_index = self._index_key_groups()
         self._group_owner = self._key_group_owners()
         self._wait_fields = self._index_wait_fields()
+        self._alias_groups = self._index_aliases()
         self._split_sources = self._index_split_fields()
         self._filters = self._index_filters()
         self._one_active, self._activation_ref = self._resolve_activation()
         self._entry_plan: dict[str, object] = {}
         self._feeds: dict[tuple[str, str], list[str]] = {}
         self._build_entry_plan()
+        self._sms_targets: set[tuple[str, str]] = set()
+        self._sms_ready = False
+        self._real_phone_contacts: set[str] = set()
+        self._plan_sms()
+        self._warn_managed_tables()
 
     # -- bookkeeping ------------------------------------------------------------------------
 
@@ -561,6 +586,14 @@ class _Generator:
             waits.setdefault(_norm(activity.wait_field), []).append(activity.key)
         return waits
 
+    def _index_aliases(self) -> dict[tuple[str, str], list[FieldRef]]:
+        """Spec, step 3: member of an alias group (``TableModel.aliases``) -> the whole group."""
+        index: dict[tuple[str, str], list[FieldRef]] = {}
+        for group in self.model.aliases:
+            for ref in group:
+                index.setdefault(_norm(ref), list(group))
+        return index
+
     def _index_split_fields(self) -> dict[tuple[str, str], tuple[str, FieldRef]]:
         """Fields read by a split: the coverage's scenario-level and contact-level fields.
 
@@ -580,13 +613,18 @@ class _Generator:
                             (LEVEL_CONTACT, self.coverage.contact_fields)):
             for ref in refs:
                 key = _norm(ref)
-                if key in self._wait_fields and key not in condition_fields:
+                # Spec, step 3: the coverage names an alias group by its representative; every member of the
+                # group holds that value, and a read of any member counts for the group.
+                members = [_norm(member) for member in self._alias_groups.get(key, [])] or [key]
+                if any(m in self._wait_fields for m in members) and not any(m in condition_fields for m in members):
                     self._warn(
                         f"{ref[0]}.{ref[1]} è tra i campi della coverage, ma lo legge solo un wait by attribute. "
                         "Viene riempito come data del wait."
                     )
                     continue
                 sources.setdefault(key, (level, ref))
+                for member in members:
+                    sources.setdefault(member, (level, ref))
         return sources
 
     def _index_filters(self) -> dict[tuple[str, str], list[object]]:
@@ -738,7 +776,7 @@ class _Generator:
         field_type = _field_type(field)
         if field_type == "emailaddress" or self._is_default_email_field(table, field):
             rules.append(_Rule("email"))
-        elif field_type == "phone":
+        elif field_type == "phone" or ref in self._sms_targets:
             rules.append(_Rule("phone"))
         elif field_type == "date":
             rules.append(_Rule("date"))
@@ -827,6 +865,8 @@ class _Generator:
         if kind == "email":
             return self._email_value(table, field, row)
         if kind == "phone":
+            if row.contact_key in self._real_phone_contacts and _norm((table.name, field.name)) in self._sms_targets:
+                return self.settings.real_phone.strip()
             return self.settings.fake_phone
         if kind == "date":
             return self._format_date(self.generation_time)
@@ -928,6 +968,9 @@ class _Generator:
         if isinstance(flt, DateBoundFilter):
             days = self.settings.window_start_days if flt.bound == "start" else self.settings.window_end_days
             return self._format_date(self.generation_time + timedelta(days=days))
+        if isinstance(flt, DateOffsetFilter):
+            # Spec, step 3: the date part moves by ``days``; the time of day stays the generation time's.
+            return self._format_date(self.generation_time + timedelta(days=flt.days))
         if isinstance(flt, IsNullFilter):
             return _SKIP if flt.negated else None   # IS NOT NULL: any value of the lower rules passes
         return _SKIP
@@ -1068,11 +1111,57 @@ class _Generator:
             return None
         return local, domain
 
-    def _uses_real_phone(self, case: Case) -> bool:
-        """Hook for the spec's real phone rule ("In each case whose path sends a message to a phone, one
-        of the 3 contacts gets the tester's real number"). No supported activity type sends to a phone,
-        so no contact uses the real number."""
-        return False
+    def _plan_sms(self) -> None:
+        """Spec, "Phone" and step 3, "SMS sends": in each case whose path sends an SMS, one contact gets the
+        tester's real number in the entry column the journey sends to (``defaults.mobileNumber``) and in the
+        source column the entry SELECT copies it from. ``_sms_targets`` holds those columns; ``_sms_ready``
+        says the real number can be written. One warning says why not when a case sends an SMS and it cannot."""
+        if not any(case.sms_sent for case in self.coverage.cases):
+            return
+        entry = self._entry
+        name = self.package.journey.default_mobile_field
+        column = entry.field(name) if entry is not None and name else None
+        reasons: list[str] = []
+        if not (self.settings.real_phone or "").strip():
+            reasons.append("nessun numero reale impostato, quindi tutti i contatti ricevono il numero finto "
+                           f"{self.settings.fake_phone}")
+        if not name:
+            reasons.append("il journey non indica la colonna del numero di telefono a cui invia gli SMS "
+                           "(defaults.mobileNumber)")
+        elif column is None:
+            reasons.append(f"la colonna {name} del numero di invio non è in "
+                           f"{entry.name if entry is not None else self.model.entry_table}")
+        targets: list[FieldRef] = []
+        if column is not None:
+            targets.append((entry.name, column.name))
+            if self.model.entry_query is not None:
+                expr = self._entry_plan.get(column.name)
+                resolved = self._resolve_column(expr.source) if isinstance(expr, SelectColumn) else None
+                if resolved is None or resolved[0] is entry:
+                    reasons.append(f"la entry query non copia {entry.name}.{column.name} da una colonna di una "
+                                   "tabella sorgente, quindi il numero reale non si può scrivere")
+                    targets = []
+                else:
+                    targets.append((resolved[0].name, resolved[1].name))
+        if reasons:
+            self._warn("Gli SMS del journey non si possono verificare: " + "; ".join(reasons) + ". "
+                       "L'SMS parte comunque sul percorso, ma nessun contatto lo riceve su un numero reale.")
+            return
+        for ref in targets:
+            for member in self._alias_groups.get(_norm(ref), [ref]):
+                self._sms_targets.add(_norm(member))
+            self._sms_targets.add(_norm(ref))
+        self._sms_ready = True
+
+    def _warn_managed_tables(self) -> None:
+        """Spec, step 3, "Synchronized data extensions": the CSV of a managed table is produced and imported like
+        the others; the note tells the tester that the rows will also arrive from the sync."""
+        for table, _ in self._tables_plan:
+            if table.managed:
+                self._warn(
+                    f"{table.name} è una data extension sincronizzata dal CRM (managed): il CSV si importa come gli "
+                    "altri e le sue righe arriveranno anche dalla sincronizzazione."
+                )
 
     def _build_contacts(self, scenarios: list[Scenario]) -> list[Contact]:
         """Spec, "Email": "Contacts that must open or click get the tester's real inbox with
@@ -1085,6 +1174,8 @@ class _Generator:
         for scenario in scenarios:
             for case in scenario.cases:
                 real = bool(case.manual_actions) and inbox is not None and not case.inbox_blocked_reason
+                if self._sms_ready and case.sms_sent and case.contact_keys:
+                    self._real_phone_contacts.add(case.contact_keys[0])   # the first contact receives the SMS
                 if case.manual_actions and inbox is None:
                     manual_without_inbox += 1
                 if case.manual_actions and case.inbox_blocked_reason:
@@ -1097,7 +1188,7 @@ class _Generator:
                         email = f"{inbox[0]}+{key}@{inbox[1]}" if real else f"{key}@{UNDELIVERABLE_DOMAIN}"
                     self._contact_email[key] = email
                     contacts.append(Contact(key=key, case_id=case.id, scenario_id=scenario.id,
-                                            uses_real_inbox=real, uses_real_phone=self._uses_real_phone(case),
+                                            uses_real_inbox=real, uses_real_phone=key in self._real_phone_contacts,
                                             email=email))
         if manual_without_inbox:
             self._warn(
@@ -1189,8 +1280,9 @@ class _Generator:
 
     def _wait_moment(self, wait_key: str, minutes_after: Optional[int], scenario: Scenario,
                      case: Case) -> Optional[datetime]:
-        """The date written for a wait by attribute in this case's rows, plus ``minutes_after``; None when the
-        date or the minutes are not known."""
+        """The moment the wait by attribute ends in this case's rows (the date written for it moved by the offset
+        and the time of day of the wait, ``graph.wait_end``), plus ``minutes_after``; None when the date or the
+        minutes are not known."""
         activity = self.package.journey.activities.get(wait_key)
         if activity is None or activity.wait_field is None or minutes_after is None:
             return None
@@ -1206,7 +1298,8 @@ class _Generator:
             return None
         try:
             moment = datetime.strptime(value, self.settings.date_format)
-        except ValueError:
+            moment = wait_end(activity, moment)   # spec, step 3: the offset and the time of day of the wait
+        except (ValueError, UnsupportedOperator):
             return None
         return moment + timedelta(minutes=minutes_after)
 
@@ -1381,11 +1474,32 @@ class _Generator:
                         "Viene scritta la chiave generata, così le tabelle restano collegate dal join."
                     )
                     return _as_text(key)
+            required = self._computed_by_query_value(entry, field, expr, row)
+            if required is not _SKIP:
+                return required
             self._note_placeholder(entry, field, problem)
             return self._fallback_value(entry, field, row)
         value = self._normalise(_as_text(value), entry, field)
         self._check_entry_requirements(entry, field, row, value)
         return value
+
+    def _computed_by_query_value(self, entry: Table, field: Field, expr: object, row: _Row) -> object:
+        """Spec, step 3, "Columns the entry query derives": an entry column that a split reads and that the entry
+        query computes with an expression the generator does not understand takes the value the case needs
+        (rule 2), with a warning in place of a placeholder. _SKIP when the column is not in that situation."""
+        if not _has_unsupported(expr):
+            return _SKIP
+        rule = next((r for r in self._own_rules(entry, field) if r.kind == "split"), None)
+        if rule is None:
+            return _SKIP
+        value = self._rule_value(rule, entry, field, row)
+        if value is _SKIP:
+            return _SKIP
+        self._warn(
+            f"{entry.name}.{field.name}: la entry query la calcola con un'espressione non compresa; il CSV contiene "
+            "il valore che il caso richiede, valido con l'import diretto."
+        )
+        return self._normalise(_as_text(value), entry, field)
 
     def _evaluate(self, expr: object, sources: dict[str, dict[str, Value]]) -> tuple[Value, Optional[str]]:
         """Spec, "Table selection": "simple select expressions (column, literal, CONCAT, current date)";

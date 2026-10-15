@@ -25,6 +25,19 @@ Spec, "Extensions beyond the pilot" (12 October 2026), as report.md and the test
   deadline of a manual action comes from the waits between the email and the engagement split
   (``Case.action_windows``); each test gives its minimum duration; report.md lists only the assumptions the
   export triggers.
+
+Spec, "Extensions for time-dependent journeys" (14 October 2026), as report.md and the testbook apply it:
+
+- Validity of the data: report.md opens with the deadline for importing and activating (the entry time plus
+  ``CoverageResult.validity_days``) and lists the perishable values; each test that has a ``Case.validity_days``
+  gives its own deadline in the Note.
+- The clock: the steps of a test list the timeline of its case, "Giorno N (date and time): ...".
+- Exit criteria: a section of report.md says which are evaluated at the end of every wait, which are not
+  modelled, and the state of their coverage target; a case that leaves the journey that way says so last.
+- SMS sends: the steps and the expected result name the SMS and the contact that receives it (the one with the
+  real number), or say it cannot be checked without a real number.
+- Synchronized data extensions (managed): their CSV is imported like the others; a note says the table is
+  synchronized from the CRM.
 """
 
 from __future__ import annotations
@@ -35,13 +48,14 @@ import io
 import math
 import re
 import zipfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Iterable, Optional
 
 from openpyxl import Workbook
 from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 from openpyxl.styles import Alignment, Font, PatternFill
 
+from . import criteria
 from .datagen import (
     SCENARIO_COLUMNS,
     UNDELIVERABLE_DOMAIN,
@@ -61,12 +75,14 @@ from .model import (
     KIND_EMAIL,
     KIND_ENGAGEMENT,
     KIND_RANDOM,
+    KIND_SMS,
     KIND_UNSUPPORTED,
     KIND_UPDATE,
     KIND_WAIT_ATTRIBUTE,
     KIND_WAIT_DURATION,
     KIND_WAIT_STO,
     LEVEL_SCENARIO,
+    ROLE_LINK,
     STATUS_COVERED,
     STATUS_MANUAL,
     STATUS_NOT_COVERED,
@@ -554,6 +570,10 @@ def _not_modelled_text(package) -> Optional[str]:
         parts.append("Il journey ha un filtro di ingresso che il generatore non modella: alcuni contatti generati "
                      "potrebbero non entrare.")
     goals, exits = getattr(journey, "goal_count", 0), getattr(journey, "exit_count", 0)
+    parsed = getattr(journey, "exits", None) or []
+    if parsed:
+        # Spec, step 3: the exit criteria the generator can evaluate are modelled; only the others are reported here.
+        exits = sum(1 for exit_ in parsed if exit_.unsupported_reason is not None)
     if goals or exits:
         found = ([_plural(goals, "goal", "goal")] if goals else []) + \
                 ([_plural(exits, "criterio di uscita", "criteri di uscita")] if exits else [])
@@ -595,6 +615,96 @@ def unsupported_warning(result: GenerationResult) -> Optional[str]:
     if shown:
         text += f": {_join_words(shown)}"
     return text + ". Per questi branch i dati di test non indicano il percorso dei contatti."
+
+
+# ---------------------------------------------------------------------------
+# Time-dependent journeys (spec, "Extensions for time-dependent journeys", 14 October 2026)
+# ---------------------------------------------------------------------------
+
+_ROLE_WORDS = {ROLE_LINK: "collegamento"}    # the report's role names are Salesforce's own words, except this one
+_DAY_LEVEL_WORDS = "confronto sul giorno"    # how coverage.py names the day-level comparison in its bound notes
+_EXIT_WORDS = "criteri di uscita"
+
+
+def role_text(roles: Iterable[str]) -> str:
+    """The roles of a table as report.md and the page write them: ``{"split", "source"}`` -> "source, split",
+    and the role ``link`` as "collegamento"."""
+    return ", ".join(sorted(_ROLE_WORDS.get(role, role) for role in roles)) or "nessuno"
+
+
+def entry_time(result: GenerationResult) -> datetime:
+    """Spec, "The clock": the clock starts at the entry time, a setting whose default is the generation time."""
+    return result.settings.entry_time or result.generation_time
+
+
+def activation_deadline(result: GenerationResult) -> Optional[datetime]:
+    """Spec, "Validity of the data": the entry time plus the earliest validity over the cases; None when nothing
+    depends on the clock."""
+    days = getattr(result.coverage, "validity_days", None)
+    return None if days is None else entry_time(result) + timedelta(days=days)
+
+
+def activation_deadline_text(result: GenerationResult) -> Optional[str]:
+    """The sentence report.md opens with and the page shows after the generation: by when to import the files
+    and activate the journey. None when the data is not perishable."""
+    deadline = activation_deadline(result)
+    if deadline is None:
+        return None
+    days = result.coverage.validity_days
+    valid = ("non tollerano ritardi di attivazione" if days <= 0
+             else f"restano validi {_plural(days, 'giorno', 'giorni')}")
+    return (f"Importa i file e attiva il journey entro {_date(deadline, result.settings)}: i valori scelti rispetto "
+            f"all'ora di ingresso {valid}.")
+
+
+def _one_line(text) -> str:
+    return " ".join(str(text or "").split())
+
+
+def exit_description(exit_) -> str:
+    """An exit criterion in words: the description the export gives it, or its formula."""
+    text = _one_line(exit_.description)
+    if not text and exit_.formula is not None:
+        text = formula_text(exit_.formula)
+    return text or _one_line(exit_.name) or exit_.key
+
+
+def exit_evaluation_text(exit_) -> str:
+    """Whether the generator evaluates an exit criterion (at the end of every wait) or not, and why."""
+    if exit_.unsupported_reason is None:
+        return "valutato alla fine di ogni wait"
+    return f"non modellato: {_one_line(exit_.unsupported_reason).rstrip('.')}"
+
+
+def _exit_phrase(journey: Journey) -> str:
+    """" (description; description)" of the exit criteria the generator evaluates, or nothing."""
+    found = [exit_description(e) for e in getattr(journey, "exits", None) or [] if e.unsupported_reason is None]
+    return f" ({'; '.join(found)})" if found else ""
+
+
+def _managed_tables(result: GenerationResult) -> list[str]:
+    """The tables with a CSV that Package Manager marks as managed (synchronized) data extensions: spec,
+    "Synchronized data extensions", their rows also arrive from the CRM sync."""
+    found = []
+    for name in result.data.tables:
+        table = _table_of(result.package, name)
+        if table is not None and getattr(table, "managed", False):
+            found.append(name)
+    return found
+
+
+def _managed_text(result: GenerationResult, names: list[str], short: bool = False) -> str:
+    """The note on a managed (synchronized) table (spec, "Synchronized data extensions"): its CSV is imported like
+    the others and its rows will also arrive from the sync; ``short`` is the form for the import instructions."""
+    one = len(names) == 1
+    who = _join_words(names)
+    synced = "è una data extension sincronizzata dal CRM" if one else "sono data extension sincronizzate dal CRM"
+    imported = "il CSV si importa" if one else "i CSV si importano"
+    arrive = "le sue righe arriveranno" if one else "le loro righe arriveranno"
+    if short:
+        return f"{who} {synced}: {imported} come gli altri e {arrive} anche dalla sincronizzazione."
+    return (f"{who} {synced} (managed data extension, che Package Manager segnala come NO_DEPLOY o "
+            f"ManagedDataExtension): {imported} come gli altri e {arrive} anche dalla sincronizzazione.")
 
 
 def _known_steps(steps: Iterable[Step], unknown_from: Optional[str]) -> list[Step]:
@@ -743,6 +853,9 @@ class _TestbookContext:
     name_counts: dict = dataclasses.field(default_factory=dict)     # test-name part -> number of cases
     entry_kind: str = ENTRY_AUTOMATION                              # EntryEvent.kind
     entry_mode: Optional[str] = None                                # entryMode, when in SINGLE_ENTRY_MODES
+    import_names: list = dataclasses.field(default_factory=list)    # CSV files to import (managed tables included)
+    managed: list = dataclasses.field(default_factory=list)         # synchronized (managed) tables, noted as such
+    real_phone_keys: set = dataclasses.field(default_factory=set)   # contacts that hold the real phone number
 
 
 def _testbook_context(result: GenerationResult) -> _TestbookContext:
@@ -750,11 +863,16 @@ def _testbook_context(result: GenerationResult) -> _TestbookContext:
     scenarios = _ordered_scenarios(result)
     journey = result.package.journey
     contact_fields = {(table.lower(), field.lower()) for table, field in result.coverage.contact_fields}
+    managed = _managed_tables(result)
+    csv_names = [table_file_name(name) for name in result.data.tables]
     return _TestbookContext(
         result=result,
         journey=journey,
         settings=result.settings,
-        csv_names=[table_file_name(name) for name in result.data.tables],
+        csv_names=csv_names,
+        import_names=list(csv_names),
+        managed=managed,
+        real_phone_keys={c.key for c in result.data.contacts if getattr(c, "uses_real_phone", False)},
         one_active=on,
         activation_ref=ref,
         first_scenario=scenarios[0] if scenarios else None,
@@ -917,18 +1035,20 @@ def _preconditions(context: _TestbookContext, scenario: Scenario, case: Case) ->
     entry_csv = table_file_name(entry)
     if context.entry_kind == ENTRY_OTHER:
         # Spec: "The team tests a copy of the journey whose entry source is a data extension with the same columns".
-        others = [name for name in context.csv_names if name != entry_csv]
+        others = [name for name in context.import_names if name != entry_csv]
         first = (f"Importa {entry_csv} nella data extension di ingresso della copia del journey, che ha le stesse "
                  f"colonne di {entry}.")
         if others:
             first = f"Importa {_join_words(others)}, poi " + first[0].lower() + first[1:]
     else:
-        first = f"Importa questi file CSV: {', '.join(context.csv_names)}."
-        if len(context.csv_names) > 1 and entry_csv in context.csv_names:
+        first = f"Importa questi file CSV: {', '.join(context.import_names)}."
+        if len(context.import_names) > 1 and entry_csv in context.import_names:
             first += f" Importa {entry_csv} per ultimo."
         if context.entry_kind == ENTRY_RUN_ONCE:
             first += " Importa tutti i file prima di attivare il journey."
     lines = [first]
+    if context.managed:
+        lines.append(_managed_text(context.result, context.managed, short=True))
     if context.one_active:
         table, field = context.activation_ref
         lines.append(f"Scenario attivo: {scenario.key}. In {table}, {field} è True solo sulla sua riga.")
@@ -1105,6 +1225,9 @@ def _detailed_steps(context: _TestbookContext, scenario: Scenario, case: Case) -
     else:
         steps.append(f"Verifica che le righe dello scenario {scenario.key} siano state importate.")
     steps.append(_entry_step(context))
+    timeline = _timeline_step(context, case)
+    if timeline:
+        steps.append(timeline)
     waits = _wait_descriptions(context, scenario, case)
     unknown = _unknown_from(case)
     if waits:
@@ -1121,9 +1244,108 @@ def _detailed_steps(context: _TestbookContext, scenario: Scenario, case: Case) -
     else:
         steps.append("Il percorso non ha wait.")
     steps.extend(_manual_steps(context, scenario, case))
+    steps.extend(_sms_steps(context, case))
     steps.append("Raccogli le evidenze per ogni contatto: le email ricevute, i valori scritti dal journey e l'ultima "
                  "attività raggiunta.")
     return "\n".join(f"{number}. {text}" for number, text in enumerate(steps, 1))
+
+
+def _timeline_text(context: _TestbookContext, point, exit_key: Optional[str]) -> str:
+    """One step of the timeline in words; the wait at whose end the exit criteria take the contact out says so."""
+    journey = context.journey
+    activity = journey.activities.get(point.activity_key)
+    label = _quoted_label(journey, point.activity_key)
+    if activity is None:
+        return label
+    kind = activity.kind
+    if kind in (KIND_WAIT_DURATION, KIND_WAIT_ATTRIBUTE, KIND_WAIT_STO):
+        if exit_key == point.activity_key and point.outcome_key is None:
+            return f"il contatto esce dal journey alla fine del wait {label} per i criteri di uscita{_exit_phrase(journey)}"
+        return f"fine del {'send-time wait' if kind == KIND_WAIT_STO else 'wait'} {label}"
+    if kind == KIND_EMAIL:
+        return f"invio dell'email {label}"
+    if kind == KIND_SMS:
+        return f"invio dell'SMS {label}"
+    if kind == KIND_UPDATE:
+        return f"Update contact {label}"
+    if point.outcome_key is not None and len(activity.outcomes) > 1:
+        return f"{label}, branch '{_outcome_label(journey, point.activity_key, point.outcome_key)}'"
+    return label
+
+
+def _timeline_lines(context: _TestbookContext, points, exit_key: Optional[str]) -> list[str]:
+    """Spec, step 3, "The clock": "The testbook writes it as days from the entry time with the absolute date and
+    time." One line per moment: the steps that happen at the same moment share a line."""
+    start = entry_time(context.result)
+    lines: list[str] = []
+    group: list[str] = []
+    current = None
+    for point in points:
+        if group and point.at != current:
+            lines.append(f"Giorno {(current - start).days} ({_date(current, context.settings)}): {'; '.join(group)}")
+            group = []
+        current = point.at
+        group.append(_timeline_text(context, point, exit_key))
+    if group:
+        lines.append(f"Giorno {(current - start).days} ({_date(current, context.settings)}): {'; '.join(group)}")
+    return lines
+
+
+def _timeline_step(context: _TestbookContext, case: Case) -> Optional[str]:
+    """The timeline of the case as one numbered step; nothing for a case without one."""
+    timeline = list(getattr(case, "timeline", None) or [])
+    if not timeline:
+        return None
+    lines = ["   " + line for line in _timeline_lines(context, timeline, case.exit_by_criteria)]
+    if case.random is not None:
+        for branch in case.random.branches:
+            branch_lines = _timeline_lines(context, getattr(branch, "timeline", ()) or (), branch.exit_by_criteria)
+            if branch_lines:
+                lines.append(f"   Branch {_branch_label(context.journey, case.random.activity_key, branch)} del random split:")
+                lines.extend("      " + line for line in branch_lines)
+    start = _date(entry_time(context.result), context.settings)
+    return f"Controlla che il percorso rispetti questi tempi, contati dall'ora di ingresso ({start}):\n" + "\n".join(lines)
+
+
+def _sms_steps(context: _TestbookContext, case: Case) -> list[str]:
+    """Spec, step 3, "SMS sends": the step names the SMS and the contact that receives it (the one with the real
+    number); without a real number the SMS is sent to the fake one and cannot be checked."""
+    settings = context.settings
+    receiving = [key for key in case.contact_keys if key in context.real_phone_keys]
+    mobile = getattr(context.journey, "default_mobile_field", None)
+    where = f" nella colonna {mobile} di {context.result.table_model.entry_table}" if mobile else ""
+    steps = []
+    for key in _unique(getattr(case, "sms_sent", None) or []):
+        label = _quoted_label(context.journey, key)
+        if receiving:
+            steps.append(f"SMS {label} inviato al numero del contatto {receiving[0]}, che ha il numero reale "
+                         f"{settings.real_phone.strip()}{where}. Controlla che l'SMS arrivi sul telefono.")
+        else:
+            steps.append(f"SMS {label} inviato ai contatti del test, che hanno il numero fittizio "
+                         f"{settings.fake_phone}: senza un numero di telefono reale l'SMS non può essere verificato. "
+                         "Controlla solo l'ultima attività raggiunta.")
+    return steps
+
+
+def _sms_result(context: _TestbookContext, case: Case) -> Optional[str]:
+    """The SMS received, in the expected result."""
+    sent = _unique(getattr(case, "sms_sent", None) or [])
+    if not sent:
+        return None
+    names = _join_words(_quoted_label(context.journey, key) for key in sent)
+    receiving = [key for key in case.contact_keys if key in context.real_phone_keys]
+    if receiving:
+        return (f"- SMS ricevuti: {names} sul telefono del contatto {receiving[0]}, che ha il numero reale "
+                f"{context.settings.real_phone.strip()}; gli altri contatti hanno il numero fittizio "
+                f"{context.settings.fake_phone}.")
+    return (f"- SMS inviati: {names}; non verificabile senza numero reale, perché i contatti hanno il numero fittizio "
+            f"{context.settings.fake_phone}.")
+
+
+def _exit_result(context: _TestbookContext, wait_key: str) -> str:
+    """The exit by criteria as the last event of the expected result."""
+    return (f"i contatti escono dal journey alla fine del wait {_quoted_label(context.journey, wait_key)}, perché "
+            f"soddisfano i criteri di uscita{_exit_phrase(context.journey)}.")
 
 
 def _unknown_from(case: Case) -> Optional[str]:
@@ -1163,24 +1385,31 @@ def _expected_result(context: _TestbookContext, case: Case) -> str:
     if case.random is None and case.unknown_from is not None:
         # Spec, "Honest outcomes": the path is unknown from that activity on, never "the last activity reached".
         before = f" prima di {_activity_label(journey, case.unknown_from)}"
+        sms = _sms_result(context, case)
         return "\n".join([
             f"Per ciascuno di questi contatti: {_join_words(keys) if keys else 'nessuno'}.",
             f"- Email ricevute{before}: {_emails_text(journey, case.emails_sent)}.",
             f"- Valori scritti dal journey{before}: "
             f"{_writes_text(case.writes, _current_time_fields(journey, base_keys), now_text)}.",
+        ] + ([sms] if sms else []) + [
             f"- {_unknown_text(journey, case.unknown_from, case.unknown_reason)}. Annota l'ultima attività raggiunta "
             "da ogni contatto.",
         ])
     if case.random is None:
         last = f"- Ultima attività raggiunta: {_activity_label(journey, case.end_activity_key)}."
         end = _end_sentence(journey, case.steps[-1] if case.steps else None)
-        return "\n".join([
+        sms = _sms_result(context, case)
+        lines = [
             f"Per ciascuno di questi contatti: {_join_words(keys) if keys else 'nessuno'}.",
             f"- Email ricevute: {_emails_text(journey, case.emails_sent)}.",
             f"- Valori scritti dal journey: "
             f"{_writes_text(case.writes, _current_time_fields(journey, base_keys), now_text)}.",
-            f"{last} {end}" if end else last,
-        ])
+        ] + ([sms] if sms else []) + [f"{last} {end}" if end else last]
+        if case.exit_by_criteria:
+            # Spec, step 3: the expected path ends with "leaves the journey at the end of <wait>, because the
+            # exit criteria are met".
+            lines.append("- Uscita: " + _exit_result(context, case.exit_by_criteria))
+        return "\n".join(lines)
     random_key = case.random.activity_key
     lines = [
         f"Per ciascuno dei {len(keys)} contatti {_key_range(keys)}, fino al random split "
@@ -1188,8 +1417,11 @@ def _expected_result(context: _TestbookContext, case: Case) -> str:
         f"- Email ricevute: {_emails_text(journey, case.emails_sent)}.",
         f"- Valori scritti dal journey: "
         f"{_writes_text(case.writes, _current_time_fields(journey, base_keys), now_text)}.",
-        "Poi ogni contatto prende uno dei branch del random split:",
     ]
+    sms = _sms_result(context, case)
+    if sms:
+        lines.append(sms)
+    lines.append("Poi ogni contatto prende uno dei branch del random split:")
     for branch in case.random.branches:
         branch_keys = base_keys + [step.activity_key for step in branch.steps]
         if branch.unknown_from is not None:
@@ -1197,6 +1429,8 @@ def _expected_result(context: _TestbookContext, case: Case) -> str:
             last = last[0].lower() + last[1:]
         else:
             last = f"ultima attività raggiunta: {_activity_label(journey, branch.end_activity_key)}"
+        if getattr(branch, "exit_by_criteria", None):
+            last += "; " + _exit_result(context, branch.exit_by_criteria).rstrip(".")
         lines.append(f"- {_branch_label(journey, random_key, branch)}: email ricevute: "
                      f"{_emails_text(journey, branch.emails_sent)}; "
                      f"valori scritti: {_writes_text(branch.writes, _current_time_fields(journey, branch_keys), now_text)}; "
@@ -1260,10 +1494,31 @@ def _note(context: _TestbookContext, scenario: Scenario, case: Case) -> str:
         if chance is not None:
             notes.append(f"Con una probabilità del {smallest.percentage}% per ogni contatto, questo intervallo si "
                          f"verifica in circa il {chance}% dei run.")
+    notes.extend(_time_notes(context, case))
     not_modelled = _not_modelled_text(context.result.package)
     if not_modelled:
         notes.append(not_modelled)
     return " ".join(notes)
+
+
+def _time_notes(context: _TestbookContext, case: Case) -> list[str]:
+    """Spec, step 3: the deadline of this case ("Validity of the data") and, when a branch of its path rests on a
+    bound, the day-level comparison it is decided on (the note coverage.py wrote for this case)."""
+    notes = []
+    days = getattr(case, "validity_days", None)
+    if days is not None:
+        result = context.result
+        start = entry_time(result)
+        notes.append(f"Attiva entro {_date(start + timedelta(days=days), context.settings)}: i valori di questo test "
+                     f"restano validi {_plural(days, 'giorno', 'giorni')} dall'ora di ingresso "
+                     f"({_date(start, context.settings)}), poi un branch o un wait potrebbe leggerli in modo diverso.")
+    for warning in context.result.coverage.warnings:
+        if _DAY_LEVEL_WORDS not in warning:
+            continue
+        named = re.split(r"[\s,]+", warning.split(", in cui")[0])
+        if case.id in named:
+            notes.append(_sentence(warning))
+    return notes
 
 
 def _excel_text(value):
@@ -1527,6 +1782,11 @@ def _section_title(result: GenerationResult) -> str:
         f"{_date(result.generation_time, settings)} con il run identifier {settings.run_id}.",
         intro,
     ]
+    deadline = activation_deadline_text(result)
+    if deadline:
+        # Spec, step 3, "Honest checks": "The report opens with the deadline for activation when the data is
+        # perishable, next to the warning on unsupported elements."
+        parts.append(f"> **Attenzione:** {deadline}")
     warning = unsupported_warning(result)
     if warning:
         # Spec, "Honest outcomes": "report.md and the page open with a warning when unsupported elements leave
@@ -1558,10 +1818,19 @@ def _section_summary(result: GenerationResult) -> str:
         ["Branch non coperti", not_covered],
         ["Branch coperti solo tramite un random split", statistical],
     ]
+    targets = list(getattr(coverage, "exit_targets", None) or [])
+    exits_covered = sum(1 for t in targets if t.status != STATUS_NOT_COVERED)
+    if targets:
+        # Spec, step 3: "the summary counts it apart from the branches of the splits".
+        rows += [["Target dei criteri di uscita", len(targets)], ["Target dei criteri di uscita coperti", exits_covered]]
     text = (f"I dati di test comprendono {_plural(len(coverage.scenarios), 'scenario', 'scenari')}, "
             f"{_plural(len(cases), 'caso', 'casi')} e {_plural(len(data.contacts), 'contatto', 'contatti')}. "
             f"Su {len(coverage.branches)} branch, {_covered(covered)}, "
             f"{_covered(manual)} con un'azione manuale e {_covered(not_covered, 'non coperto')}.")
+    if targets:
+        text += (f" Contati a parte dai branch degli split, i criteri di uscita (exit criteria) hanno "
+                 f"{_plural(len(targets), 'target', 'target')}: {exits_covered} "
+                 f"{'coperto' if exits_covered == 1 else 'coperti'}.")
     tables = list(result.table_model.scenario_tables)
     if len(tables) == 1:
         terms = f"Uno scenario è una riga di {tables[0]}, condivisa da tutti i suoi contatti."
@@ -1608,20 +1877,26 @@ def _section_checks(result: GenerationResult) -> str:
 
 def _section_tables(result: GenerationResult) -> str:
     rows = []
+    managed = _managed_tables(result)
     for role in result.table_model.tables.values():
         data = result.data.tables.get(role.name)
-        rows.append([role.name, ", ".join(sorted(role.roles)) or "nessuno",
+        csv_name = table_file_name(role.name) if role.selected else "no"
+        rows.append([role.name, role_text(role.roles),
                      _LEVEL_WORDS.get(role.level, role.level) if role.level else "-",
-                     table_file_name(role.name) if role.selected else "no",
-                     len(data.rows) if data is not None else "-", role.reason])
+                     csv_name, len(data.rows) if data is not None else "-", role.reason])
     selected = [table_file_name(name) for name in result.data.tables]
     text = (f"{_plural(len(selected), 'tabella riceve', 'tabelle ricevono')} un CSV: "
             f"{_join_words(selected) if selected else 'nessuna'}.")
     meaning = ("Una tabella riceve un CSV quando il journey o la entry query la leggono. Una tabella a livello di "
                "contatto ha una riga per contatto. Una tabella a livello di scenario ha una riga per scenario, "
                "condivisa dai suoi contatti.")
-    return "\n\n".join(["## Tabelle", text, meaning,
-                        _md_table(["Tabella", "Ruolo", "Livello", "CSV", "Righe", "Motivo"], rows)])
+    if any(ROLE_LINK in role.roles for role in result.table_model.tables.values()):
+        meaning += (" Una tabella di collegamento sta sul percorso tra il contatto e una tabella che uno split o un "
+                    "wait legge.")
+    parts = ["## Tabelle", text, meaning, _md_table(["Tabella", "Ruolo", "Livello", "CSV", "Righe", "Motivo"], rows)]
+    if managed:
+        parts.append(_managed_text(result, managed))
+    return "\n\n".join(parts)
 
 
 def _activation_is_entry_filter(result: GenerationResult, ref: FieldRef) -> bool:
@@ -1644,7 +1919,7 @@ def _how_to_run(result: GenerationResult, context: _TestbookContext) -> str:
     direct import only, and no automation runs during the test."""
     model = result.table_model
     entry_csv = table_file_name(model.entry_table)
-    others = [name for name in context.csv_names if name != entry_csv]
+    others = [name for name in context.import_names if name != entry_csv]
     automation = _entry_procedures(result)
     kind = context.entry_kind
     parts = ["### Come eseguire i test"]
@@ -1655,6 +1930,11 @@ def _how_to_run(result: GenerationResult, context: _TestbookContext) -> str:
                      "già presente quando entra.")
     else:
         parts.append(f"Importa {entry_csv}.")
+    if context.managed:
+        parts.append(_managed_text(result, context.managed, short=True))
+    deadline = activation_deadline_text(result)
+    if deadline:
+        parts.append(f"{deadline} Dopo quella data i test possono dare un percorso diverso da quello atteso.")
     if automation:
         parts.append(f"Assunzione da verificare al primo run reale: l'ingresso in questo journey è pianificato "
                      f"dall'automation {automation}. Per una entry source di tipo data extension pianificata da "
@@ -1696,6 +1976,7 @@ def _how_to_run(result: GenerationResult, context: _TestbookContext) -> str:
     if not_modelled:
         parts.append(not_modelled)
     parts.extend(_contact_address_text(result))
+    parts.extend(_sms_text(result))
     for case in result.coverage.cases:
         smallest = _smallest_branch(case)
         if case.random is None or smallest is None:
@@ -1741,6 +2022,25 @@ def _entry_source_paragraphs(result: GenerationResult, context: _TestbookContext
         f"colonne di {entry}. {import_text}. Poi fai entrare i contatti secondo la pianificazione della copia: con "
         "Run Once, per esempio, importa tutti i CSV prima di attivarla.",
     ]
+
+
+def _sms_text(result: GenerationResult) -> list[str]:
+    """Spec, step 3, "SMS sends": the real number goes to one contact of each case that sends an SMS; without it
+    "the SMS cannot be checked and the report says so"."""
+    sms_cases = [case for case in result.coverage.cases if getattr(case, "sms_sent", None)]
+    if not sms_cases:
+        return []
+    mobile = getattr(result.package.journey, "default_mobile_field", None)
+    where = f" nella colonna {mobile} di {result.table_model.entry_table}" if mobile else ""
+    phone = (result.settings.real_phone or "").strip()
+    ids = [case.id for case in sms_cases]
+    who = f"Il caso {ids[0]} invia" if len(ids) == 1 else f"I casi {_join_words(ids)} inviano"
+    if phone:
+        return [f"{who} un SMS. Un contatto per caso riceve il numero reale {phone}{where}, e controlla l'SMS sul suo "
+                f"telefono; gli altri contatti ricevono il numero fittizio {result.settings.fake_phone}."]
+    return [f"{who} un SMS, ma non è stato indicato un numero di telefono reale: l'invio dell'SMS non può essere "
+            f"verificato. I contatti ricevono il numero fittizio {result.settings.fake_phone}{where}; l'invio avviene "
+            "comunque sul percorso."]
 
 
 def _contact_address_text(result: GenerationResult) -> list[str]:
@@ -1946,6 +2246,54 @@ def _section_not_covered(result: GenerationResult) -> str:
     return "\n\n".join(parts)
 
 
+def _exit_target_text(target: Optional[BranchStatus]) -> str:
+    """The state of the coverage target of an exit criterion: the cases that leave that way, or why none does."""
+    if target is None:
+        return "nessun target"
+    if target.status == STATUS_NOT_COVERED:
+        return f"non coperto: {_one_line(target.reason).rstrip('.') or 'nessun contatto esce così'}"
+    cases = ", ".join(target.covered_by)
+    words = "coperto con un'azione manuale" if target.status == STATUS_MANUAL else "coperto"
+    return f"{words} dai casi {cases}" if len(target.covered_by) > 1 else f"{words} dal caso {cases}"
+
+
+def _section_exits(result: GenerationResult) -> str:
+    """Spec, step 3, "Exit criteria and goals": every exit criterion with its description, whether the generator
+    evaluates it (at the end of every wait) or not and why, and the state of its coverage target; the branches no
+    contact can reach because of them are a finding on the journey."""
+    journey = result.package.journey
+    exits = list(getattr(journey, "exits", None) or [])
+    if not exits:
+        return ""
+    targets = {t.activity_key: t for t in getattr(result.coverage, "exit_targets", None) or []}
+    modelled = [e for e in exits if e.unsupported_reason is None]
+    text = (f"Il journey ha {_plural(len(exits), 'criterio di uscita', 'criteri di uscita')} (exit criteria). "
+            "Journey Builder valuta i criteri di uscita di ogni contatto quando il suo tempo in un wait scade "
+            "(documentato).")
+    if modelled:
+        text += (" Il generatore valuta alla fine di ogni wait del percorso, con l'orologio, i criteri che sa valutare: "
+                 "il contatto che li soddisfa esce dal journey in quel punto e il percorso atteso del suo caso finisce "
+                 "lì. Ogni criterio è un target di coverage a parte, \"criteri di uscita soddisfatti\".")
+    if len(modelled) < len(exits):
+        text += (" I criteri non modellati non sono valutati, quindi alcuni contatti potrebbero uscire dal journey "
+                 "alla fine di un wait, prima della fine del percorso atteso.")
+    rows = [[f"{e.key}: {exit_description(e)}", exit_evaluation_text(e),
+             _exit_target_text(targets.get(e.key)) if e.unsupported_reason is None else "non applicabile"]
+            for e in exits]
+    parts = ["## Criteri di uscita", text,
+             _md_table(["Criterio", "Valutazione", "Target criteri di uscita soddisfatti"], rows)]
+    behind = [b for b in result.coverage.branches
+              if b.status == STATUS_NOT_COVERED and _EXIT_WORDS in (b.reason or "")]
+    findings = [w for w in result.coverage.warnings if w.startswith("rilievo sul journey")]
+    if behind or findings:
+        parts.append(f"{_plural(len(behind), 'branch', 'branch')} non "
+                     f"{'è raggiungibile' if len(behind) == 1 else 'sono raggiungibili'} perché i contatti che li "
+                     "raggiungerebbero escono prima dal journey per i criteri di uscita. La sezione Branch non coperti "
+                     "ne spiega il motivo." if behind else "")
+        parts.extend(_sentence(finding) for finding in findings)
+    return "\n\n".join(part for part in parts if part)
+
+
 def _section_special_branches(result: GenerationResult) -> str:
     """Spec, "Outputs": every branch ends in one of three states, each with its reason. The
     branches covered with a manual action, and those crossed only through a random split, are
@@ -2136,6 +2484,7 @@ def _section_warnings(result: GenerationResult) -> str:
         ("Selezione delle tabelle e SQL", list(result.table_model.warnings) + (list(query.warnings) if query else [])),
         ("Coverage", result.coverage.warnings),
         ("Generazione dei dati", result.data.warnings),
+        ("Valori che dipendono dall'ora di ingresso", list(getattr(result.coverage, "perishable", None) or [])),
     ]
     patterns: list[str] = []
     groups: list[tuple[str, list[str]]] = []
@@ -2165,7 +2514,7 @@ def _ignored_entry_columns(result: GenerationResult) -> list[str]:
 
 # Text comparisons whose answer depends on letter case (spec assumption "Text comparisons").
 _TEXT_TYPES = ("text", "emailaddress", "phone", "locale")
-_CASE_OPERATORS = ("equal", "notequal", "is", "contains", "beginswith", "endswith")
+_CASE_OPERATORS = ("equal", "notequal", "is", "isnot", "contains", "beginswith", "endswith")
 
 
 def _conditions(journey: Journey) -> list[tuple[Activity, Outcome, object]]:
@@ -2258,6 +2607,28 @@ def _triggered_assumptions(result: GenerationResult) -> list[str]:
                      f"{_plural(len(ignored), 'colonna', 'colonne')} che {result.table_model.entry_table} non ha. "
                      f"Il generatore ignora {'quella colonna' if len(ignored) == 1 else 'quelle colonne'}.")
     items.extend(_extension_assumptions(result, conditions))
+    items.extend(_time_assumptions(result, conditions))
+    return items
+
+
+def _time_assumptions(result: GenerationResult, conditions: list) -> list[str]:
+    """The assumptions of the time-dependent extensions (spec, step 3) that this export triggers. The day-level
+    comparison of relative dates is a fact confirmed by the team (14 October 2026), so it is not listed; the
+    comparison of the full date and time with hours or minutes (docs/assumptions.md row 48) still is."""
+    journey = result.package.journey
+    items = []
+    every = list(conditions) + [(None, None, c) for e in getattr(journey, "exits", None) or []
+                                for c in formula_conditions(e.formula)]
+    for _, _, condition in every:
+        relative = getattr(condition, "relative", None)
+        try:
+            full_time = relative is not None and not criteria.is_day_level(relative)
+        except criteria.UnsupportedOperator:
+            continue
+        if full_time:
+            items.append("Una condizione con una data relativa in ore o minuti confronta data e ora intere, non "
+                         "solo il giorno.")
+            break
     return items
 
 
@@ -2343,6 +2714,8 @@ _SETTING_LABELS = {
     "case_insensitive_text": "I confronti di testo ignorano maiuscole e minuscole",
     "seed": "Seed del set cover",
     "generation_time": "Ora di generazione",
+    "entry_time": "Ora di ingresso",
+    "min_validity_days": "Validità minima dei dati (giorni)",
 }
 
 
@@ -2356,6 +2729,10 @@ def _days_text(days: int) -> str:
 def _setting_text(name: str, value, result: GenerationResult) -> str:
     if name == "generation_time":
         return _date(result.generation_time, result.settings)
+    if name == "entry_time":
+        return _date(value, result.settings) if value is not None else "l'ora di generazione"
+    if name == "min_validity_days" and isinstance(value, int):
+        return _plural(value, "giorno", "giorni")
     if name == "one_active_scenario" and value is None:
         return "sì, quando viene rilevato un campo di attivazione"
     if name == "activation_field" and value is None:
@@ -2400,6 +2777,7 @@ def write_report(result: GenerationResult) -> str:
         _section_tables(result),
         _section_scenarios(result),
         _section_not_covered(result),
+        _section_exits(result),
         _section_special_branches(result),
         _section_unsupported(result),
         _section_warnings(result),

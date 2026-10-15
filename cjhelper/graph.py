@@ -23,6 +23,49 @@ Spec, "Extensions beyond the pilot":
   fail and take the contact out of the journey, so the path is unknown from that Update
   contact on (``insert_problem``).
 
+Spec, "Extensions for time-dependent journeys (step 3, 14 October 2026)":
+
+- The clock. "The clock starts at the entry time" (``Walker(entry_time=...)``, default the
+  generation time ``now``). "A wait by duration advances the clock by its amount (a month counts
+  28 days, as before)"; "a send-time wait advances the clock by nothing". "A wait by attribute
+  holds the contact until the date in its field plus its offset ... at the time of day given by
+  specifiedTime when it has one, otherwise at the time of day held in the field. When that moment
+  is already past, the contact goes on at once": ``clock = max(clock, wait_end(activity, date))``.
+  "When the field is null, the contact goes on at once (assumption)". Decision splits and exit
+  criteria are evaluated with the clock (relative dates); "an email and an SMS are sent at the clock
+  time; {{DateTime.Now}} written by an Update contact is the clock time". "Every case carries its
+  timeline": ``WalkState.timeline`` holds one TimelinePoint per Step, in the same order, with the
+  clock when the step is recorded (for a wait, the moment it ends).
+- Exit criteria. "Journey Builder evaluates the exit criteria of a journey for each contact when the
+  contact's time in a wait activity expires (documented)": at the end of every wait the evaluable
+  exit criteria (``JourneyFilter.formula`` set, no ``unsupported_reason``) are evaluated with the
+  clock and the same data sources as a decision split; when one is true the contact leaves the
+  journey there (``Step(wait, None)``, ``STOP_EXIT_CRITERIA``). Goals are not modelled.
+- SMS. "SMSSYNC is a send ... It has no branching": recorded in ``WalkState.sms_sent`` like an email.
+- ``fixed_delays``: "every fixed delay with which a contact can reach that split (the sum of the
+  waits by duration on each path from the start, waits by attribute counting zero)".
+
+Assumptions of the walker for step 3 (the spec does not say; each is in the developer report):
+
+- A wait by attribute whose value is not a readable date ends at once, as a null one does. Dates
+  are read as criteria.py reads them (ISO 8601, a time zone offset converted to UTC and dropped),
+  or in the walker's date format.
+- A wait by attribute whose field the walk has not decided (UNKNOWN) ends at once unless the caller's
+  predicate ``ends_at_once_when_unknown`` says otherwise; without a predicate it always ends at once,
+  which is the behaviour before step 3 (the field of a "wait only" date is written by datagen with
+  the date rule of the waits). A wait whose field the export does not identify ends at once too.
+- Simplification: the field of a wait by attribute is read live (``value_of``) even when its
+  expression is Journey Data (``{{Event...}}``): Activity keeps no data source, and on the entry
+  table the live value differs from the snapshot only when an Update contact wrote the field.
+- The offset of a wait by attribute moves the date with ``criteria.shift_date`` (months and years
+  are calendar steps), then ``wait_time_of_day`` replaces the time of day (seconds dropped). The
+  time of day applies to waits by attribute only: a wait by duration advances by its amount.
+- A wait by duration whose duration cannot be read advances the clock by nothing, as it counts 0 in
+  ``fixed_delays``.
+- When several exit criteria are evaluable, the contact leaves when any of them is true; the first
+  true one, in export order, is named.
+- A current-date default of a field in a row an Update contact inserts is the clock at the insert.
+
 The walker here serves two callers:
 
 - coverage.py explores the journey symbolically: some field values are not yet
@@ -37,7 +80,7 @@ Both use the same code, so the check cannot drift from the generator.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Callable, Optional
 
 from . import criteria
@@ -47,6 +90,7 @@ from .model import (
     KIND_EMAIL,
     KIND_ENGAGEMENT,
     KIND_RANDOM,
+    KIND_SMS,
     KIND_UNSUPPORTED,
     KIND_UPDATE,
     KIND_WAIT_ATTRIBUTE,
@@ -62,12 +106,16 @@ from .model import (
     FieldRef,
     Formula,
     Journey,
+    JourneyFilter,
     Outcome,
+    RelativeDate,
     Step,
     Table,
+    TimelinePoint,
     Value,
     Write,
     formula_conditions,
+    formula_text,
 )
 
 SPLIT_KINDS = (KIND_DECISION, KIND_ENGAGEMENT, KIND_RANDOM)
@@ -144,7 +192,8 @@ ValueLookup = Callable[[FieldRef], "Value | Unknown"]
 
 
 def evaluate(formula: Optional[Formula], lookup: ValueLookup, schema: Schema,
-             case_insensitive: bool, snapshot: Optional[ValueLookup] = None) -> "bool | Unknown":
+             case_insensitive: bool, snapshot: Optional[ValueLookup] = None,
+             now: Optional[datetime] = None) -> "bool | Unknown":
     """Evaluate a split formula. UNKNOWN propagates only when it could still change the answer.
 
     AND: any False -> False; else any UNKNOWN -> UNKNOWN; else True.
@@ -152,6 +201,8 @@ def evaluate(formula: Optional[Formula], lookup: ValueLookup, schema: Schema,
     The remainder outcome has no formula and is handled by the caller.
     ``lookup`` answers Contact Data conditions; ``snapshot``, when given, answers Journey Data
     conditions (the entry row as it was at entry), otherwise ``lookup`` answers them too.
+    ``now`` is the clock when the contact reaches the activity (spec, step 3, "The clock"); a condition
+    with a relative date needs it (criteria.evaluate_condition raises UnsupportedOperator without it).
     """
     if formula is None:
         return True
@@ -160,11 +211,11 @@ def evaluate(formula: Optional[Formula], lookup: ValueLookup, schema: Schema,
         value = _reader(formula, lookup, snapshot)(ref)
         if isinstance(value, Unknown):
             return UNKNOWN
-        return criteria.evaluate_condition(formula, value, schema.field_type(ref), case_insensitive)
+        return criteria.evaluate_condition(formula, value, schema.field_type(ref), case_insensitive, now=now)
     assert isinstance(formula, ConditionGroup)
     saw_unknown = False
     for item in formula.items:
-        r = evaluate(item, lookup, schema, case_insensitive, snapshot)
+        r = evaluate(item, lookup, schema, case_insensitive, snapshot, now)
         if isinstance(r, Unknown):
             saw_unknown = True
         elif formula.operator == "AND" and r is False:
@@ -230,6 +281,7 @@ STOP_UNSUPPORTED = "unsupported"      # an activity type the PoC does not unders
 STOP_LOOP = "loop"                    # an activity was reached twice on the same path
 STOP_DANGLING = "dangling"            # an outcome points to a missing activity
 STOP_ERROR = "error"                  # an operator or value the PoC cannot evaluate
+STOP_EXIT_CRITERIA = "exit_criteria"  # the exit criteria took the contact out at the end of a wait (spec, step 3)
 
 
 @dataclass
@@ -247,6 +299,14 @@ class WalkState:
     stop_detail: str = ""                                     # plain words
     pending_field: Optional[FieldRef] = None                  # STOP_UNDETERMINED: the field to decide
     pending_outcomes: list[Outcome] = field(default_factory=list)  # STOP_CHOICE: the outcomes to choose from
+    # Spec, step 3, "The clock": the clock of this contact (set by Walker.start to the entry time), the clock at
+    # every step (one TimelinePoint per Step, same order), the SMS sends, and the wait at whose end the exit
+    # criteria took the contact out of the journey.
+    clock: Optional[datetime] = None
+    timeline: list[TimelinePoint] = field(default_factory=list)
+    sms_sent: list[str] = field(default_factory=list)         # SMS activity keys
+    exit_by_criteria: Optional[str] = None
+    inserted_at: dict[str, datetime] = field(default_factory=dict)   # lower-case table -> clock of its first write
 
     def clone(self) -> "WalkState":
         return WalkState(
@@ -254,6 +314,8 @@ class WalkState:
             waits=list(self.waits), overrides=dict(self.overrides), inserted=set(self.inserted),
             visited=set(self.visited),
             current=self.current, stop=None, stop_detail="", pending_field=None, pending_outcomes=[],
+            clock=self.clock, timeline=list(self.timeline), sms_sent=list(self.sms_sent),
+            exit_by_criteria=self.exit_by_criteria, inserted_at=dict(self.inserted_at),
         )
 
     @property
@@ -303,16 +365,25 @@ class Walker:
     lookup; Journey Data always reads the lookup (the snapshot taken at entry).
     ``row_fields`` lists the tables with the "row present / row absent" variable (table -> its field
     linked to the contact key, as in TableModel.existence_tested); see the module docstring.
+
+    Spec, step 3, "The clock": ``entry_time`` is where every contact's clock starts (default ``now``,
+    the generation time). ``ends_at_once_when_unknown(ref)`` answers for a wait by attribute whose
+    field the walk has not decided: True, the wait ends at once and the walk goes on; False, the walk
+    stops with STOP_UNDETERMINED on that field so the caller can branch on its values. Without it,
+    such a wait always ends at once (the behaviour before step 3).
     """
 
     def __init__(self, journey: Journey, schema: Schema, emails: dict[str, EmailAsset],
                  case_insensitive: bool, now: Optional[datetime] = None, date_format: str = "%Y-%m-%d %H:%M",
-                 row_fields: Optional[dict[str, FieldRef]] = None):
+                 row_fields: Optional[dict[str, FieldRef]] = None, entry_time: Optional[datetime] = None,
+                 ends_at_once_when_unknown: Optional[Callable[[FieldRef], bool]] = None):
         self.journey = journey
         self.schema = schema
         self.emails = emails
         self.case_insensitive = case_insensitive
         self.now = now or datetime.now()
+        self.entry_time = entry_time or self.now
+        self.ends_at_once_when_unknown = ends_at_once_when_unknown
         self.date_format = date_format
         self.row_fields: dict[str, FieldRef] = {}
         for ref in (row_fields or {}).values():
@@ -323,7 +394,9 @@ class Walker:
         self.on_decision: Optional[Callable[[Activity, dict[FieldRef, Value]], None]] = None
 
     def start(self) -> WalkState:
+        """A contact at the start of the journey; its clock reads the entry time (spec, step 3)."""
         state = WalkState()
+        state.clock = self.entry_time
         state.current = self.journey.start_key
         if state.current is None:
             state.stop = STOP_ERROR
@@ -339,20 +412,23 @@ class Walker:
             present = lookup(linked)
             if not isinstance(present, Unknown) and is_null(present):
                 # The row was absent and an update contact inserted it.
-                return GENERATED_KEY if ref == linked else self.inserted_default(ref)
+                if ref == linked:
+                    return GENERATED_KEY
+                return self.inserted_default(ref, state.inserted_at.get(ref[0].lower()))
         return row_lookup(lookup, self.row_fields)(ref)
 
-    def inserted_default(self, ref: FieldRef) -> Value:
+    def inserted_default(self, ref: FieldRef, at: Optional[datetime] = None) -> Value:
         """A field an Update contact did not write, in a row it inserted: the field's default value, as an
-        insert gives it (assumptions rows 20, 29 and 46; a current-date default is the walk's ``now``), or
-        null when the field has no default."""
+        insert gives it (assumptions rows 20, 29 and 46), or null when the field has no default. A
+        current-date default is the time of the insert, ``at`` (the clock when the Update contact ran,
+        spec step 3: "{{DateTime.Now}} written by an Update contact is the clock time"), else ``now``."""
         table = self.schema.table(ref[0])
         found = table.field(ref[1]) if table is not None else None
         default = (found.default or "").strip() if found is not None else ""
         if not default:
             return None
         if default.lower().replace(" ", "") in CURRENT_DATE_DEFAULTS:
-            return self.now.strftime(self.date_format)
+            return (at or self.now).strftime(self.date_format)
         return default
 
     def insert_problem(self, activity: Activity, state: WalkState, lookup: ValueLookup) -> Optional[str]:
@@ -417,6 +493,8 @@ class Walker:
             state.stop_detail = f"l'attività '{key}' è raggiunta due volte sullo stesso percorso"
             return
         state.visited.add(key)
+        if state.clock is None:
+            state.clock = self.entry_time   # a state not made by start(): the clock starts at the entry time
 
         kind = activity.kind
         if kind == KIND_DECISION:
@@ -429,24 +507,27 @@ class Walker:
                 return
             self._take(activity, outcome, state)
         elif kind == KIND_UNSUPPORTED:
-            state.steps.append(Step(key, None))
+            self._record(state, key, None)
             state.stop = STOP_UNSUPPORTED
             state.stop_detail = f"l'attività '{key}' è di un tipo non supportato, {activity.raw_type}"
+        elif kind in WAIT_KINDS:
+            self._wait(activity, state, lookup)
         else:
             if kind == KIND_UPDATE:
                 problem = self.insert_problem(activity, state, lookup)
                 if problem is not None:
                     # Spec, "Honest outcomes": past an element the walk cannot predict, the path is unknown.
-                    state.steps.append(Step(key, None))
+                    self._record(state, key, None)
                     state.stop = STOP_UNSUPPORTED
                     state.stop_detail = problem
                     return
             if kind == KIND_EMAIL:
                 state.emails_sent.append(key)
+            elif kind == KIND_SMS:
+                # Spec, step 3, "SMS sends": "SMSSYNC is a send ... It has no branching", sent at the clock time.
+                state.sms_sent.append(key)
             elif kind == KIND_UPDATE:
                 self._update(activity, state)
-            elif kind in WAIT_KINDS:
-                state.waits.append(key)
             self._take(activity, activity.outcomes[0] if activity.outcomes else None, state)
 
     def take(self, state: WalkState, activity: Activity, outcome: Optional[Outcome]) -> None:
@@ -457,19 +538,147 @@ class Walker:
         state.pending_outcomes = []
         self._take(activity, outcome, state)
 
+    def _record(self, state: WalkState, activity_key: str, outcome_key: Optional[str]) -> None:
+        """Append a Step and its TimelinePoint, the clock as the step is recorded (spec, step 3: "Every case
+        carries its timeline: the clock at every step of the expected path")."""
+        if state.clock is None:
+            state.clock = self.entry_time
+        state.steps.append(Step(activity_key, outcome_key))
+        state.timeline.append(TimelinePoint(activity_key, outcome_key, state.clock))
+
     def _take(self, activity: Activity, outcome: Optional[Outcome], state: WalkState) -> None:
         if outcome is None:
-            state.steps.append(Step(activity.key, None))
+            self._record(state, activity.key, None)
             state.current = None
             state.stop = STOP_EXIT
             return
-        state.steps.append(Step(activity.key, outcome.key))
+        self._record(state, activity.key, outcome.key)
         state.current = outcome.next
         if outcome.next is None:
             state.stop = STOP_EXIT
 
+    # -- waits and exit criteria (spec, step 3) -------------------------------------------
+
+    def _wait(self, activity: Activity, state: WalkState, lookup: ValueLookup) -> None:
+        """Hold the contact until the wait ends, then apply the exit criteria, then move on.
+
+        The clock and ``waits`` change only once the walk can go past the wait: when the walk stops on a field
+        to decide (the wait's date, or a field of the exit criteria), the caller re-runs the whole wait.
+        """
+        end = self._wait_end_at(activity, state, lookup)
+        if end is None:
+            return
+        met = self._exit_criteria(activity, state, lookup, end)
+        if state.stop is not None and state.stop != STOP_ERROR:
+            return
+        state.clock = end
+        state.waits.append(activity.key)
+        if state.stop == STOP_ERROR:
+            self._record(state, activity.key, None)
+            return
+        if met is not None:
+            # Spec, step 3: "when they are true the contact leaves the journey there".
+            self._record(state, activity.key, None)
+            state.exit_by_criteria = activity.key
+            state.current = None
+            state.stop = STOP_EXIT_CRITERIA
+            state.stop_detail = (f"il contatto esce dal journey alla fine del wait '{activity.key}', perché soddisfa "
+                                 f"il criterio di uscita (exit criteria) {_filter_text(met)}")
+            return
+        self._take(activity, activity.outcomes[0] if activity.outcomes else None, state)
+
+    def _wait_end_at(self, activity: Activity, state: WalkState, lookup: ValueLookup) -> Optional[datetime]:
+        """When the wait ends for this contact, never before the clock; None when the walk stopped here.
+
+        Spec, step 3, "The clock": a wait by duration "advances the clock by its amount (a month counts 28 days,
+        as before)"; a send-time wait "advances the clock by nothing"; a wait by attribute ends at
+        ``wait_end(activity, date)`` and "when that moment is already past, the contact goes on at once";
+        "when the field is null, the contact goes on at once (assumption)". See the module docstring for the
+        undecided field, an unreadable date or duration, and the Journey Data simplification.
+        """
+        clock = state.clock if state.clock is not None else self.entry_time
+        if activity.kind == KIND_WAIT_DURATION:
+            return clock + timedelta(minutes=fixed_wait_minutes(activity) or 0)
+        if activity.kind != KIND_WAIT_ATTRIBUTE or activity.wait_field is None:
+            return clock
+        ref = self.schema.canonical(activity.wait_field)
+        value = self.value_of(state, ref, lookup)
+        if isinstance(value, Unknown):
+            if self.ends_at_once_when_unknown is None or self.ends_at_once_when_unknown(ref):
+                return clock
+            state.stop = STOP_UNDETERMINED
+            state.pending_field = ref
+            state.visited.discard(activity.key)   # the caller will re-run this activity
+            return None
+        moment = self.read_date(value)
+        if moment is None:
+            return clock
+        try:
+            end = wait_end(activity, moment)
+        except criteria.UnsupportedOperator as exc:
+            self._record(state, activity.key, None)
+            state.stop = STOP_ERROR
+            state.stop_detail = f"non è possibile calcolare quando termina il wait '{activity.key}': {exc}"
+            return None
+        return max(clock, end)
+
+    def read_date(self, value: "Value | Unknown") -> Optional[datetime]:
+        """The date and time a wait by attribute reads, or None when the value is null or not a readable date.
+
+        As criteria.py reads dates (ISO 8601, ``YYYY-MM-DD[ HH:MM[:SS]]``, a time zone offset converted to UTC
+        and dropped), or in the walker's date format (the form of ``{{DateTime.Now}}`` writes)."""
+        if isinstance(value, Unknown) or is_null(value):
+            return None
+        text = str(value).strip()
+        try:
+            moment = datetime.fromisoformat(text)
+        except ValueError:
+            try:
+                return datetime.strptime(text, self.date_format)
+            except ValueError:
+                return None
+        if moment.tzinfo is not None:
+            moment = moment.astimezone(timezone.utc).replace(tzinfo=None)
+        return moment
+
+    def _exit_criteria(self, wait: Activity, state: WalkState, lookup: ValueLookup,
+                       end: datetime) -> Optional[JourneyFilter]:
+        """The exit criterion that takes the contact out at the end of ``wait``, or None.
+
+        Spec, step 3, "Exit criteria and goals": "At the end of every wait on a path the exit criteria are
+        evaluated with the clock", with "the same operators, data sources and relative dates as a decision
+        split" (Contact Data live, Journey Data from the snapshot). Only the evaluable ones count (a formula and
+        no ``unsupported_reason``); goals are not modelled. A field the walk has not decided stops it with
+        STOP_UNDETERMINED (the caller re-runs the wait); an operator that cannot be evaluated with STOP_ERROR.
+        """
+        def value(ref: FieldRef):
+            return self.value_of(state, ref, lookup)
+
+        def snapshot(ref: FieldRef):
+            return self.snapshot_of(ref, lookup)
+
+        undecided: Optional[JourneyFilter] = None
+        for exit_ in evaluable_exits(self.journey):
+            try:
+                result = evaluate(exit_.formula, value, self.schema, self.case_insensitive, snapshot, now=end)
+            except criteria.UnsupportedOperator as exc:
+                state.stop = STOP_ERROR
+                state.stop_detail = (f"il criterio di uscita (exit criteria) {_filter_text(exit_)}, valutato alla fine "
+                                     f"del wait '{wait.key}', usa un operatore che il PoC non supporta: {exc}")
+                return None
+            if result is True:
+                return exit_
+            if isinstance(result, Unknown) and undecided is None:
+                undecided = exit_
+        if undecided is not None:
+            state.stop = STOP_UNDETERMINED
+            state.pending_field = first_unknown_field(undecided.formula, value, self.schema, snapshot)
+            state.visited.discard(wait.key)   # the caller will re-run the wait once the field is decided
+        return None
+
     def _decision(self, activity: Activity, state: WalkState, lookup: ValueLookup) -> None:
-        """Outcomes in order, first true wins; the remainder when none matched."""
+        """Outcomes in order, first true wins; the remainder when none matched. Evaluated at the clock time
+        (spec, step 3: a condition can "compare a date with Today")."""
         def value(ref: FieldRef):
             return self.value_of(state, ref, lookup)
 
@@ -499,15 +708,16 @@ class Walker:
                 return
             if outcome.unsupported_reason:
                 observe()
-                state.steps.append(Step(activity.key, None))
+                self._record(state, activity.key, None)
                 state.stop = STOP_UNSUPPORTED
                 state.stop_detail = (f"il branch '{outcome.label or outcome.key}' dello split '{activity.key}' "
                                      f"non è supportato: {outcome.unsupported_reason}")
                 return
             try:
-                result = evaluate(outcome.formula, value, self.schema, self.case_insensitive, snapshot)
+                result = evaluate(outcome.formula, value, self.schema, self.case_insensitive, snapshot,
+                                  now=state.clock)
             except criteria.UnsupportedOperator as exc:
-                state.steps.append(Step(activity.key, None))
+                self._record(state, activity.key, None)
                 state.stop = STOP_ERROR
                 state.stop_detail = f"lo split '{activity.key}' usa un operatore che il PoC non supporta: {exc}"
                 return
@@ -522,23 +732,25 @@ class Walker:
                 return
         # No remainder outcome and nothing matched: the contact leaves the journey here.
         observe()
-        state.steps.append(Step(activity.key, None))
+        self._record(state, activity.key, None)
         state.current = None
         state.stop = STOP_EXIT
         state.stop_detail = f"lo split '{activity.key}' non trova alcun branch corrispondente e non ha un remainder"
 
     def _update(self, activity: Activity, state: WalkState) -> None:
         """Spec: written values are tracked so a later split reads the updated value (Contact Data only);
-        a write into a table with the "row present / row absent" variable inserts the contact's row."""
+        a write into a table with the "row present / row absent" variable inserts the contact's row.
+        Spec, step 3: "{{DateTime.Now}} written by an Update contact is the clock time"."""
         for w in activity.writes:
             ref = self.schema.canonical((w.table, w.field))
             value = w.value
             if value == DATETIME_NOW:
-                value = self.now.strftime(self.date_format)
+                value = (state.clock or self.entry_time).strftime(self.date_format)
             state.overrides[ref] = value
             state.writes.append(Write(ref[0], ref[1], value))
             if ref[0].lower() in self.row_fields:
                 state.inserted.add(ref[0].lower())
+                state.inserted_at.setdefault(ref[0].lower(), state.clock or self.entry_time)
 
 
 # ---------------------------------------------------------------------------
@@ -579,6 +791,153 @@ def fixed_wait_minutes(activity: Activity) -> Optional[int]:
             return None
         return activity.wait_amount * per_unit
     return 0
+
+
+# The units of a wait's offset (waitUnit, upper case, without the plural S) as criteria.shift_date takes them.
+OFFSET_UNITS = {"MINUTE": "minutes", "HOUR": "hours", "DAY": "days", "WEEK": "weeks", "MONTH": "months",
+                "YEAR": "years"}
+
+
+def wait_end(activity: Activity, value: datetime) -> datetime:
+    """The moment a wait by attribute whose field holds ``value`` ends (the clock is not considered here).
+
+    Spec, step 3, "The clock": "A wait by attribute holds the contact until the date in its field plus its
+    offset (waitDuration and waitUnit, which may be negative: "13 days before Entitle_RequestCancellationDate"
+    is an offset of -13 days), at the time of day given by specifiedTime when it has one, otherwise at the time
+    of day held in the field." The offset is applied with ``criteria.shift_date`` (minutes, hours, days and weeks
+    are fixed lengths; months and years are calendar steps, unlike the 28-day month of a wait by duration), then
+    ``wait_time_of_day`` ("HH:MM") replaces the time of day, seconds dropped. The caller keeps the later of this
+    moment and the clock ("When that moment is already past, the contact goes on at once"). Raises
+    criteria.UnsupportedOperator when the offset unit or the time of day cannot be read.
+    """
+    end = value
+    amount = activity.wait_offset_amount or 0
+    if amount:
+        unit = offset_unit(activity.wait_offset_unit)
+        if unit is None:
+            raise criteria.UnsupportedOperator(f"l'unità {activity.wait_offset_unit!r} dello spostamento del wait "
+                                               f"'{activity.key}' non è supportata (unità supportate: "
+                                               f"{', '.join(sorted(OFFSET_UNITS))})")
+        end = criteria.shift_date(end, RelativeDate(sign=1 if amount > 0 else -1, amount=abs(amount), unit=unit))
+    time_of_day = (activity.wait_time_of_day or "").strip()
+    if time_of_day:
+        hour, minute = _time_of_day(time_of_day, activity)
+        end = end.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    return end
+
+
+def offset_unit(unit: Optional[str]) -> Optional[str]:
+    """``MINUTES``, ``HOURS``, ``DAYS``, ``WEEKS``, ``MONTHS``, ``YEARS`` (any case, with or without the plural S)
+    as the lower-case plural unit criteria.shift_date takes; None for anything else."""
+    text = (unit or "").strip().upper()
+    return OFFSET_UNITS.get(text[:-1] if text.endswith("S") else text)
+
+
+def _time_of_day(text: str, activity: Activity) -> tuple[int, int]:
+    """``(hour, minute)`` of a ``specifiedTime`` written ``H:MM``, ``HH:MM`` or ``HH:MM:SS``."""
+    parts = text.split(":")
+    if len(parts) in (2, 3) and all(p.strip().isdigit() for p in parts):
+        hour, minute = int(parts[0]), int(parts[1])
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            return hour, minute
+    raise criteria.UnsupportedOperator(f"l'ora del giorno {text!r} a cui termina il wait '{activity.key}' non si "
+                                       "può leggere (forma attesa HH:MM)")
+
+
+def evaluable_exits(journey: Journey) -> list[JourneyFilter]:
+    """The exit criteria the walker evaluates at the end of every wait, in export order: those with a formula
+    and no ``unsupported_reason`` (spec, step 3: "Exit criteria with a condition the generator cannot evaluate
+    are reported as not modelled")."""
+    return [e for e in journey.exits if e.formula is not None and e.unsupported_reason is None]
+
+
+def _filter_text(exit_: JourneyFilter) -> str:
+    """How an exit criterion is named in plain words: its description, else its formula, with its name."""
+    described = " ".join((exit_.description or "").split()) or formula_text(exit_.formula)
+    return f"'{exit_.name}' ({described})" if exit_.name and exit_.name != described else f"'{described}'"
+
+
+# At most this many fixed delays are kept per activity (the smallest), so that a journey with many paths stays
+# cheap to explore.
+MAX_FIXED_DELAYS = 32
+MINUTES_PER_DAY = 24 * 60
+
+
+def fixed_delays(journey: Journey) -> tuple[dict[str, set[float]], list[str]]:
+    """For every activity key, the fixed delays in days with which a contact can reach it; plus warnings.
+
+    Spec, step 3, "Values of a date field read with relative dates or by a wait with an offset": "every fixed
+    delay with which a contact can reach that split (the sum of the waits by duration on each path from the
+    start, waits by attribute counting zero)". A wait by duration adds ``fixed_wait_minutes`` (a month counts
+    28 days), a send-time wait and a wait by attribute add 0; a wait whose duration cannot be read adds 0 and
+    is reported once. The start activity has {0.0}; an activity no path reaches has an empty set. The delays
+    are summed in whole minutes and divided by 1440 once, so equal sums give equal floats.
+
+    The paths are followed along the outcomes from the start; an outcome that leads back to an activity already
+    on the path is not followed (a journey with a loop is reported by ``structural_problems``). To stay linear in
+    the size of the journey the sets are propagated in topological order of a depth-first search instead of
+    listing every path (the pilot has hundreds of thousands): on a journey without loops this gives the same
+    sets; on one with a loop, the outcomes that close a loop in the search are the ones left out. Each set keeps
+    its MAX_FIXED_DELAYS smallest values, with a warning naming the activity (the activities after it then
+    start from the kept values).
+    """
+    activities = journey.activities
+    minutes: dict[str, set[int]] = {key: set() for key in activities}
+    warnings: list[str] = []
+    if journey.start_key is None or journey.start_key not in activities:
+        return {key: set() for key in activities}, warnings
+    order, back_edges = _depth_first_order(journey)
+    minutes[journey.start_key].add(0)
+    for key in order:
+        if len(minutes[key]) > MAX_FIXED_DELAYS:
+            minutes[key] = set(sorted(minutes[key])[:MAX_FIXED_DELAYS])
+            warnings.append(f"l'attività '{key}' si può raggiungere con più di {MAX_FIXED_DELAYS} ritardi fissi "
+                            f"diversi (somme dei wait by duration sui percorsi dall'inizio): sono tenuti i "
+                            f"{MAX_FIXED_DELAYS} più brevi")
+        activity = activities[key]
+        added = fixed_wait_minutes(activity)
+        if added is None:
+            warnings.append(f"la durata del wait '{key}' ({activity.wait_amount} {activity.wait_unit}) non si può "
+                            "leggere: nei ritardi fissi con cui i contatti raggiungono le attività successive conta 0")
+            added = 0
+        for outcome in activity.outcomes:
+            if outcome.next in minutes and (key, outcome.next) not in back_edges:
+                minutes[outcome.next].update(m + added for m in minutes[key])
+    return {key: {m / MINUTES_PER_DAY for m in found} for key, found in minutes.items()}, warnings
+
+
+def _depth_first_order(journey: Journey) -> tuple[list[str], set[tuple[str, str]]]:
+    """The activities reachable from the start in topological order (reverse postorder of a depth-first search
+    along the outcomes, in export order), and the outcomes ``(from, to)`` that lead back to an activity on the
+    search's current path (they close a loop)."""
+    activities = journey.activities
+    start = journey.start_key
+    assert start is not None
+    postorder: list[str] = []
+    back_edges: set[tuple[str, str]] = set()
+    seen = {start}
+    on_path = {start}
+    stack: list[tuple[str, int]] = [(start, 0)]
+    while stack:
+        key, index = stack[-1]
+        outcomes = activities[key].outcomes
+        if index >= len(outcomes):
+            stack.pop()
+            on_path.discard(key)
+            postorder.append(key)
+            continue
+        stack[-1] = (key, index + 1)
+        nxt = outcomes[index].next
+        if nxt is None or nxt not in activities:
+            continue
+        if nxt in on_path:
+            back_edges.add((key, nxt))
+        elif nxt not in seen:
+            seen.add(nxt)
+            on_path.add(nxt)
+            stack.append((nxt, 0))
+    postorder.reverse()
+    return postorder, back_edges
 
 
 # ---------------------------------------------------------------------------

@@ -603,3 +603,580 @@ def test_action_windows_and_minimum_duration():
     assert window.attribute_wait_key == "WAIT-3" and window.minutes_after_attribute_wait == 60
     assert slow.min_duration_minutes == 2 * 24 * 60 + 60
     assert all(not c.action_windows for c in r.cases if not c.manual_actions)
+
+
+# ---------------------------------------------------------------------------
+# Spec, "Extensions for time-dependent journeys (step 3, 14 October 2026)"
+# ---------------------------------------------------------------------------
+
+from datetime import timedelta  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+from cjhelper import criteria, loader, tables  # noqa: E402
+from cjhelper.model import (  # noqa: E402
+    KIND_SMS, SOURCE_CONTACT, Activity, JourneyFilter, Outcome, Step, TimelinePoint,
+)
+
+T0 = NOW
+FMT = "%Y-%m-%d %H:%M"
+TIMED = table("DE_Master", [field("ContactId", pk=True, nullable=False), field("StartDate", "Date"),
+                            field("EndDate", "Date"), field("Status", "Text", nullable=False),
+                            field("IsDunning", "Boolean"), field("Perm", "Boolean")], sendable_field="ContactId")
+START = ("DE_Master", "StartDate")
+END = ("DE_Master", "EndDate")
+
+
+def day(k, hours=0):
+    """T0 moved by k days (and hours), in the CSV date format."""
+    return (T0 + timedelta(days=k, hours=hours)).strftime(FMT)
+
+
+def rel(table_name, field_name, operator, value, source=SOURCE_CONTACT):
+    """A condition with a relative date value, as criteria.py parses it."""
+    return Condition(table_name, field_name, operator, value, source=source, relative=criteria.relative_date(value))
+
+
+def wait_offset(key, table_name, field_name, amount, unit, next_key, time_of_day=None):
+    w = wait_attr(key, table_name, field_name, next_key)
+    w.wait_offset_amount, w.wait_offset_unit, w.wait_time_of_day = amount, unit, time_of_day
+    return w
+
+
+def sms(key, name, next_key):
+    return Activity(key=key, raw_type="SMSSYNC", kind=KIND_SMS, name=name,
+                    outcomes=[Outcome(key=key + "-out", label="", next=next_key)], sms_name=name)
+
+
+def exit_filter(key, formula, description=""):
+    return JourneyFilter(key=key, name=key, kind="exit", formula=formula, description=description)
+
+
+def engine_run(acts, tables_=(ENTRY, TIMED), exits=(), settings=None, scenario=False, aliases=()):
+    """The engine after run(), to read its validity and cut points, and the result."""
+    j = journey(acts)
+    j.exits = list(exits)
+    tm = model_for(list(tables_), scenario)
+    tm.aliases = [list(group) for group in aliases]
+    engine = coverage.CoverageEngine(package(j, list(tables_)), tm, settings or Settings(), NOW)
+    return engine, engine.run()
+
+
+def case_ending(result, key):
+    return next(c for c in result.cases if c.end_activity_key == key)
+
+
+def brute_validity(engine, ref, value):
+    """Spec, "Validity of the data": re-evaluate with the entry time moved by one day at a time, up to a year."""
+    intern = {}
+    base = engine._behaviour(ref, value, 0, intern)
+    k = 0
+    for slip in range(1, coverage.MAX_SLIP_DAYS + 1):
+        if engine._behaviour(ref, value, slip, intern) != base:
+            return k
+        k = slip
+    return None
+
+
+def assert_validity_matches_simulation(engine, ref):
+    points = engine._clock_points(ref)
+    cuts = engine._cut_points(ref, points, engine.conditions_by_field[ref])
+    for value in engine._clock_candidates(cuts, engine.conditions_by_field[ref], True):
+        assert engine._clock_validity(ref, value)[0] == brute_validity(engine, ref, value), value
+
+
+AFTER_TODAY = [decision("SPLIT-1", "Start date", [("path_a", "Future", "UPD-1", rel("DE_Master", "StartDate", "After", ";+;0;days")),
+                                                  ("path_b", "Started", "UPD-2", rel("DE_Master", "StartDate", "AtOrBefore", ";+;0;days"))],
+                        remainder_next="UPD-3"),
+               update("UPD-1", "1", [], None), update("UPD-2", "2", [], None), update("UPD-3", "3", [], None)]
+
+
+def test_relative_date_domain_classes_validity_and_choice():
+    """examples/relative_date_after_today: cut point {0}; one value per class; T0+2 (validity 1: After excludes the
+    bound), T0-2 (not perishable, rule 3 drops T0, rule 5 the earliest), null alone."""
+    engine, r = engine_run(AFTER_TODAY)
+    assert engine.cut_points[START] == [0.0]
+    assert r.domains[START] == [day(-2), day(2), None]
+    assert engine.validity[START] == {day(-2): None, day(2): 1, None: None}
+    assert all(b.status == STATUS_COVERED for b in r.branches)
+    assert {c.end_activity_key: (c.contact_values[START], c.validity_days) for c in r.cases} == {
+        "UPD-1": (day(2), 1), "UPD-2": (day(-2), None), "UPD-3": (None, None)}
+    assert r.validity_days == 1
+    [sentence] = r.perishable
+    assert sentence.startswith(f"DE_Master.StartDate = {day(2)}: resta valido 1 giorno dall'ora di ingresso, poi ")
+    assert "After" in sentence and "SPLIT-1" in sentence
+    assert_validity_matches_simulation(engine, START)
+
+
+def test_relative_date_in_the_past_with_a_strict_operator_and_null_never_representing():
+    """examples/relative_date_before_minus_days: Before ;-;7;days. Null takes the same branch as T0-7..T0-5, so it
+    never represents that class: the domain has no null; the remainder value is T0-5 (rule 4, validity 2)."""
+    acts = [decision("SPLIT-1", "No order", [("path_a", "old", "UPD-1", rel("DE_Master", "StartDate", "Before", ";-;7;days"))],
+                     remainder_next="UPD-2"),
+            update("UPD-1", "1", [], None), update("UPD-2", "2", [], None)]
+    engine, r = engine_run(acts)
+    assert engine.cut_points[START] == [-7.0]
+    assert r.domains[START] == [day(-9), day(-5)]
+    assert engine.validity[START] == {day(-9): None, day(-5): 2}
+    assert r.validity_days == 2 and r.stats["cases"] == 2
+    assert_validity_matches_simulation(engine, START)
+
+
+def test_cut_points_follow_the_fixed_delays_of_each_split():
+    """examples/relative_date_chain_waits: a 2-day wait between two windows. Cut points {45, 47, 90}; classes by
+    the branches taken on each path; rule 3 drops the cut point 90, rule 4 picks 89 (validity 42)."""
+    window = lambda upper: AND(rel("DE_Master", "EndDate", "AtOrBefore", f";+;{upper};days"),
+                               rel("DE_Master", "EndDate", "AtOrAfter", ";+;45;days"))
+    acts = [decision("SPLIT-1", "Window", [("path_a", "In", "WAIT-1", window(90))], remainder_next="UPD-3"),
+            wait_dur("WAIT-1", 2, "DAYS", "SPLIT-2"),
+            decision("SPLIT-2", "Still", [("path_a", "In", "UPD-1", window(88))], remainder_next="UPD-2"),
+            update("UPD-1", "1", [], None), update("UPD-2", "2", [], None), update("UPD-3", "3", [], None)]
+    engine, r = engine_run(acts)
+    assert engine.cut_points[END] == [45.0, 47.0, 90.0]
+    # class A of the README (SPLIT-1 remainder: T0+43, T0+44, T0+91, T0+92 and null take the same branch) is one
+    # class: 43, not perishable, is kept
+    assert r.domains[END] == [day(43), day(46), day(89)]
+    assert engine.validity[END] == {day(43): None, day(46): 1, day(89): 42}
+    assert {c.end_activity_key: c.contact_values[END] for c in r.cases} == {"UPD-3": day(43), "UPD-2": day(46),
+                                                                             "UPD-1": day(89)}
+    assert all(b.status == STATUS_COVERED for b in r.branches)
+    assert r.validity_days == 1
+    late = case_ending(r, "UPD-1")
+    assert [(p.activity_key, p.at) for p in late.timeline][:3] == [("SPLIT-1", T0), ("WAIT-1", T0 + timedelta(days=2)),
+                                                                   ("SPLIT-2", T0 + timedelta(days=2))]
+    assert_validity_matches_simulation(engine, END)
+
+
+WAIT_THEN_BOUND = [wait_offset("WAIT-1", "DE_Master", "EndDate", -13, "DAYS", "SPLIT-1"),
+                   decision("SPLIT-1", "Still ahead", [("path_a", "In time", "UPD-1", rel("DE_Master", "EndDate", "AtOrAfter", ";+;13;days"))],
+                            remainder_next="UPD-2"),
+                   update("UPD-1", "1", [], None), update("UPD-2", "2", [], None)]
+
+
+def test_wait_with_an_offset_makes_the_class_compare_on_the_bound():
+    """examples/wait_offset_then_relative_split: the wait "13 days before EndDate" holds the contact until the split
+    compares on its bound. Rule 1 drops T0+13 (validity 0), rule 2 prefers T0+14 (the wait ends after one day); the
+    late contact gets T0+11 (rule 5); the branch on the bound is noted (decided on the bound of a day-level comparison)."""
+    engine, r = engine_run(WAIT_THEN_BOUND)
+    assert engine.cut_points[END] == [13.0]
+    assert r.domains[END] == [day(11), day(14)]
+    in_time = case_ending(r, "UPD-1")
+    assert in_time.contact_values[END] == day(14) and in_time.validity_days == 1
+    assert [(p.activity_key, p.at) for p in in_time.timeline][:2] == [("WAIT-1", T0 + timedelta(days=1)),
+                                                                      ("SPLIT-1", T0 + timedelta(days=1))]
+    late = case_ending(r, "UPD-2")
+    assert late.contact_values[END] == day(11) and late.timeline[0].at == T0
+    notes = [w for w in r.warnings if "confronto sul giorno" in w]
+    assert len(notes) == 1 and "S01-C" in notes[0] and "SPLIT-1" in notes[0] and day(14) in notes[0]
+    assert_validity_matches_simulation(engine, END)
+
+
+def test_minimum_validity_setting_drives_the_choice_with_the_wait_end():
+    """Rule (1) then rule (2): with a minimum of 0 the value on which the wait ends at once wins; 2 days asks for
+    T0+15; a minimum no candidate reaches keeps them all (then rule 2 again)."""
+    picks = {}
+    for minimum in (0, 1, 2, 30):
+        _, r = engine_run(WAIT_THEN_BOUND, settings=Settings(min_validity_days=minimum))
+        picks[minimum] = case_ending(r, "UPD-1").contact_values[END]
+    assert picks == {0: day(13), 1: day(14), 2: day(15), 30: day(13)}
+
+
+def test_time_level_relative_dates_cut_at_the_hour():
+    """A relative date in hours compares the date and time ("Now"): the cut point is a fraction of a day."""
+    acts = [decision("SPLIT-1", "soon", [("path_a", "soon", "UPD-1", rel("DE_Master", "StartDate", "After", ";+;3;hours"))],
+                     remainder_next="UPD-2"),
+            update("UPD-1", "1", [], None), update("UPD-2", "2", [], None)]
+    engine, r = engine_run(acts)
+    assert engine.cut_points[START] == [0.125]
+    assert r.domains[START] == [day(-2, 3), day(2, 3)]
+    assert engine.validity[START] == {day(-2, 3): None, day(2, 3): 1}
+    assert_validity_matches_simulation(engine, START)
+
+
+def test_entry_time_setting_moves_the_clock_and_the_values():
+    """Spec, step 3: "The clock starts at the entry time, a setting whose default is the generation time"."""
+    entry = datetime(2026, 10, 20, 9, 0)
+    _, r = engine_run(AFTER_TODAY, settings=Settings(entry_time=entry))
+    assert r.domains[START] == [(entry - timedelta(days=2)).strftime(FMT), (entry + timedelta(days=2)).strftime(FMT), None]
+    assert all(c.timeline[0].at == entry for c in r.cases)
+
+
+def test_relative_predicates_are_evaluated_at_every_delay_of_their_split():
+    """A split reached with the delays 0 and 3 days: T0+3 is "after tomorrow" for the contact that comes at once but
+    not for the one that waited, so it is a class of its own, and the classes evaluate the predicate twice."""
+    acts = [decision("SPLIT-0", "perm", [("yes", "yes", "WAIT-1", cond("DE_Master", "Perm", "Is", "true"))],
+                     remainder_next="SPLIT-R"),
+            wait_dur("WAIT-1", 3, "DAYS", "SPLIT-R"),
+            decision("SPLIT-R", "later", [("path_a", "later", "UPD-1", rel("DE_Master", "StartDate", "After", ";+;1;days"))],
+                     remainder_next="UPD-2"),
+            update("UPD-1", "1", [], None), update("UPD-2", "2", [], None)]
+    engine, r = engine_run(acts)
+    assert engine.delays["SPLIT-R"] == {0.0, 3.0}
+    assert engine.cut_points[START] == [1.0, 4.0]
+    assert r.domains[START] == [day(-1), day(3), day(6)]
+    moments = dict((formula_text_of(f), m) for f, m in engine._contact_predicate_points())
+    assert moments["DE_Master.StartDate After ';+;1;days'"] == ((0.0, ()), (3.0, ()))
+    assert moments["DE_Master.Perm Is 'true'"] == ((0.0, ()),)
+    assert all(len(c.predicate_truth) == 3 for c in r.classes)
+    assert all(b.status == STATUS_COVERED for b in r.branches)
+    # the class of T0+3 takes path_a without the wait and the remainder after it
+    perm = ("DE_Master", "Perm")
+    assert [c for c in r.classes if c.values[START] == day(3) and c.values[perm] != "True"][0].predicate_truth[1:] == (True, False)
+
+
+def formula_text_of(formula):
+    from cjhelper.model import formula_text
+    return formula_text(formula)
+
+
+def test_range_operators_take_absolute_date_values_but_never_relative_ones():
+    """Spec, step 3: "The same operators with an absolute date value keep the earlier reading"; a relative value is
+    never a bound nor a named value of build_domain."""
+    c = lambda op, v: cond("DE_Master", "F", op, v)
+    assert coverage.build_domain("Date", [c("After", "2026-01-01")], False, False, FMT)[0] == \
+        ["2025-12-31 00:00", "2026-01-02 00:00"]
+    domain = coverage.build_domain("Date", [rel("DE_Master", "F", "After", ";+;0;days")], True, False, FMT)[0]
+    assert ";+;0;days" not in domain and all(v is None or v.startswith("2000-") for v in domain)
+    assert {"After", "AtOrAfter", "Before", "AtOrBefore"} <= set(coverage.RANGE_OPERATORS)
+
+
+# -- aliases --------------------------------------------------------------------
+
+ENTRY_TIER = table("DE_Entry", [field("ContactId", pk=True, nullable=False), field("CampaignName", pk=True, nullable=False),
+                                field("Tier", length=20), field("Channel", length=20)], sendable_field="ContactId")
+MASTER_TIER = table("DE_Master", [field("ContactId", pk=True, nullable=False), field("Tier", length=20)],
+                    sendable_field="ContactId")
+
+
+def test_an_entry_copy_and_its_source_are_one_variable():
+    """examples/entry_copy_alias: a Journey Data split on the entry copy, then Contact Data splits on the source.
+    One variable, named by the source (the member outside the entry table): 2 classes, 2 cases, the contradictory
+    branches unreachable."""
+    journey_gold = Condition("DE_Entry", "Tier", "Equal", "Gold", source=SOURCE_JOURNEY)
+    acts = [decision("SPLIT-1", "entry", [("path_a", "gold", "SPLIT-2", journey_gold)], remainder_next="SPLIT-3"),
+            decision("SPLIT-2", "now", [("path_a", "gold", "UPD-1", cond("DE_Master", "Tier", "Equal", "Gold"))], remainder_next="UPD-2"),
+            decision("SPLIT-3", "now", [("path_a", "gold", "UPD-3", cond("DE_Master", "Tier", "Equal", "Gold"))], remainder_next="UPD-4"),
+            update("UPD-1", "1", [], None), update("UPD-2", "2", [], None), update("UPD-3", "3", [], None),
+            update("UPD-4", "4", [], None)]
+    engine, r = engine_run(acts, (ENTRY_TIER, MASTER_TIER), aliases=[[("DE_Entry", "Tier"), ("DE_Master", "Tier")]])
+    assert engine.alias_of == {("DE_Entry", "Tier"): ("DE_Master", "Tier")}
+    assert r.contact_fields == [("DE_Master", "Tier")] and list(r.domains) == [("DE_Master", "Tier")]
+    assert len(r.classes) == 2 and r.stats["cases"] == 2
+    assert all(set(c.contact_values) == {("DE_Master", "Tier")} for c in r.cases)
+    assert case_ending(r, "UPD-1").contact_values[("DE_Master", "Tier")] == "Gold"
+    for key in (("SPLIT-2", "remainder_path"), ("SPLIT-3", "path_a")):
+        assert status(r, *key).status == STATUS_NOT_COVERED and "non raggiungibile" in status(r, *key).reason
+
+
+def test_alias_representative_is_the_first_member_outside_the_entry_table():
+    j = journey([decision("SPLIT-1", "s", [("a", "a", None, cond("DE_Entry", "Tier", "Equal", "Gold"))], remainder_next=None)])
+    tables_ = [ENTRY_TIER, MASTER_TIER, table("DE_Stage", [field("ContactId", pk=True, nullable=False), field("Tier")])]
+    tm = model_for(tables_)
+    tm.aliases = [[("DE_Entry", "Tier"), ("DE_Stage", "Tier"), ("DE_Master", "Tier")], [("DE_Entry", "Channel"), ("de_entry", "x")]]
+    engine = coverage.CoverageEngine(package(j, tables_), tm, Settings(), NOW)
+    assert engine.alias_of[("DE_Entry", "Tier")] == ("DE_Stage", "Tier")
+    assert engine.alias_of[("DE_Master", "Tier")] == ("DE_Stage", "Tier")
+    assert ("DE_Entry", "Channel") not in engine.alias_of      # no member outside the entry table: the first one
+
+
+def test_a_scenario_level_source_read_through_its_entry_copy_is_branched_on():
+    """The walker stops on the entry copy (Journey Data); the exploration branches on the source's values."""
+    acts = [decision("SPLIT-1", "channel", [("e", "email", "UPD-1", Condition("DE_Entry", "Channel", "Equal", "Email",
+                                                                             source=SOURCE_JOURNEY))],
+                     remainder_next="UPD-2"),
+            update("UPD-1", "1", [], None), update("UPD-2", "2", [], None)]
+    _, r = engine_run(acts, (ENTRY_TIER, MASTER_TIER, CONFIG), scenario=True,
+                      aliases=[[("DE_Entry", "Channel"), ("DE_Config", "Channel")]])
+    assert r.scenario_fields == [("DE_Config", "Channel")] and r.contact_fields == []
+    assert all(b.status == STATUS_COVERED for b in r.branches)
+    assert sorted(s.values[("DE_Config", "Channel")] for s in r.scenarios) == ["Email", "OTHER"]
+
+
+def test_aliases_from_the_real_table_model():
+    """examples/entry_copy_alias through loader.py and tables.py: TableModel.aliases groups the copy and its source."""
+    path = Path(__file__).resolve().parent.parent / "examples" / "entry_copy_alias" / "package.json"
+    pkg = loader.load_package(str(path))
+    tm = tables.build_table_model(pkg)
+    assert [("DE_Entry", "Tier"), ("DE_Master", "Tier")] in tm.aliases
+    r = coverage.compute_coverage(pkg, tm, Settings(generation_time=NOW), NOW)
+    assert r.contact_fields == [("DE_Master", "Tier")] and r.stats["cases"] == 2
+
+
+# -- exit criteria ------------------------------------------------------------------
+
+def exit_at_wait_end():
+    acts = [wait_dur("WAIT-1", 1, "DAYS", "SPLIT-1"),
+            decision("SPLIT-1", "Active?", [("path_a", "Active", "EMAIL-1", cond("DE_Master", "Status", "Equal", "Active"))],
+                     remainder_next="UPD-2"),
+            email("EMAIL-1", "Offer", "A1", "UPD-1"), update("UPD-1", "1", [], None), update("UPD-2", "2", [], None)]
+    exits = [exit_filter("EXITCRITERIA", OR(cond("DE_Master", "Status", "NotEqual", "Active"),
+                                            cond("DE_Master", "IsDunning", "Is", "true")), "Not active or dunning")]
+    return acts, exits
+
+
+def test_exit_criteria_target_case_and_unreachable_branch():
+    """examples/exit_criteria_at_wait_end: the exit field is collected, the exit target is covered by a case that
+    ends at the wait, and the remainder is unreachable because those contacts leave at the end of WAIT-1."""
+    acts, exits = exit_at_wait_end()
+    _, r = engine_run(acts, exits=exits)
+    assert ("DE_Master", "IsDunning") in r.contact_fields
+    [target] = r.exit_targets
+    assert (target.activity_key, target.activity_name, target.activity_kind, target.outcome_key, target.outcome_label) == \
+        ("EXITCRITERIA", "Not active or dunning", "exit", "met", "criteri di uscita soddisfatti")
+    leaving = next(c for c in r.cases if c.exit_by_criteria)
+    assert target.status == STATUS_COVERED and target.covered_by == [leaving.id]
+    assert leaving.exit_by_criteria == "WAIT-1" and leaving.end_activity_key == "WAIT-1" and leaving.unknown_from is None
+    assert leaving.steps == [Step("WAIT-1", None)]
+    assert leaving.timeline == [TimelinePoint("WAIT-1", None, T0 + timedelta(days=1))]
+    assert "criteri di uscita" in leaving.summary
+    staying = case_ending(r, "UPD-1")
+    assert staying.contact_values == {("DE_Master", "Status"): "Active", ("DE_Master", "IsDunning"): "False"}
+    assert staying.exit_by_criteria is None
+    remainder = status(r, "SPLIT-1", "remainder_path")
+    assert remainder.status == STATUS_NOT_COVERED
+    assert remainder.reason.startswith("non raggiungibile: lo split è raggiunto, ma i contatti che prenderebbero questo "
+                                       "branch escono prima dal journey alla fine del wait '1 DAYS' (WAIT-1)")
+    assert "Not active or dunning" in remainder.reason
+    assert r.stats["branches"] == 2 and r.stats["exit_targets"] == 1 and r.stats["exit_targets_covered"] == 1
+    assert r.validity_days is None
+
+
+def test_exit_criteria_that_take_everyone_out_make_the_wait_the_root_cause():
+    """examples/exit_criteria_removes_everyone: every contact reaching WAIT-1 leaves there; the branches behind it
+    are unreachable for that reason, grouped under the wait, and one warning states the finding."""
+    acts = [decision("SPLIT-1", "End date known?", [("path_a", "Known", "WAIT-1", cond("DE_Master", "EndDate", "IsNotNull"))],
+                     remainder_next="UPD-3"),
+            wait_dur("WAIT-1", 2, "DAYS", "SPLIT-2"),
+            decision("SPLIT-2", "Opt-in", [("path_a", "yes", "UPD-1", cond("DE_Master", "Perm", "Is", "true"))], remainder_next="UPD-2"),
+            update("UPD-1", "1", [], None), update("UPD-2", "2", [], None), update("UPD-3", "3", [], None)]
+    exits = [exit_filter("EXITCRITERIA", OR(cond("DE_Master", "EndDate", "IsNotNull"), cond("DE_Master", "IsDunning", "Is", "true")))]
+    engine, r = engine_run(acts, exits=exits)
+    assert engine.exited_at.get("WAIT-1", 0) > 0 and engine.passed_at.get("WAIT-1", 0) == 0
+    for outcome in ("path_a", "remainder_path"):
+        b = status(r, "SPLIT-2", outcome)
+        assert b.status == STATUS_NOT_COVERED and b.behind == ("WAIT-1", "WAIT-1-out")
+        assert b.reason.startswith("non raggiungibile: si trova a valle del branch '2 DAYS: fine del wait' (WAIT-1)")
+        assert "tutti i contatti che arrivano alla fine del wait '2 DAYS' (WAIT-1) escono dal journey per i criteri di uscita" in b.reason
+    findings = [w for w in r.warnings if w.startswith("rilievo sul journey")]
+    assert len(findings) == 1 and "WAIT-1" in findings[0]
+    assert r.exit_targets[0].status == STATUS_COVERED
+    assert status(r, "SPLIT-1", "path_a").status == STATUS_COVERED and r.stats["cases"] == 2
+
+
+def test_exit_target_not_covered_with_its_reason():
+    """No contact that reaches the wait meets the criterion; and a journey with no wait never evaluates it."""
+    acts = [decision("SPLIT-0", "a?", [("a", "a", "WAIT-1", cond("DE_Master", "Status", "Equal", "A"))], remainder_next="UPD-2"),
+            wait_dur("WAIT-1", 1, "DAYS", "UPD-1"), update("UPD-1", "1", [], None), update("UPD-2", "2", [], None)]
+    _, r = engine_run(acts, exits=[exit_filter("E1", cond("DE_Master", "Status", "Equal", "B"))])
+    [target] = r.exit_targets
+    assert target.status == STATUS_NOT_COVERED and target.covered_by == []
+    assert target.reason.startswith("non raggiungibile: nessun contatto che arriva alla fine di un wait soddisfa i criteri")
+    assert r.stats["exit_targets_covered"] == 0
+    no_wait = [decision("SPLIT-0", "perm", [("a", "a", "UPD-1", cond("DE_Master", "Perm", "Is", "true"))], remainder_next="UPD-2"),
+               update("UPD-1", "1", [], None), update("UPD-2", "2", [], None)]
+    _, r = engine_run(no_wait, exits=[exit_filter("E1", cond("DE_Master", "Status", "Equal", "B"))])
+    assert ("DE_Master", "Status") not in r.contact_fields      # never evaluated: it reads nothing
+    assert r.exit_targets[0].status == STATUS_NOT_COVERED and "nessun percorso del journey passa per un wait" in r.exit_targets[0].reason
+
+
+def test_several_exit_criteria_each_get_a_target():
+    acts = [wait_dur("WAIT-1", 1, "DAYS", "SPLIT-1"),
+            decision("SPLIT-1", "perm", [("a", "a", "UPD-1", cond("DE_Master", "Perm", "Is", "true"))], remainder_next="UPD-2"),
+            update("UPD-1", "1", [], None), update("UPD-2", "2", [], None)]
+    exits = [exit_filter("E1", cond("DE_Master", "Status", "Equal", "Out")), exit_filter("E2", cond("DE_Master", "IsDunning", "Is", "true"))]
+    engine, r = engine_run(acts, exits=exits)
+    assert [t.activity_key for t in r.exit_targets] == ["E1", "E2"]
+    assert all(t.status == STATUS_COVERED for t in r.exit_targets)
+    assert engine.exit_met_at["WAIT-1"] == {"E1", "E2"}
+    for target in r.exit_targets:
+        cases = {c.id: c for c in r.cases}
+        assert all(cases[cid].exit_by_criteria == "WAIT-1" for cid in target.covered_by)
+    assert all(b.status == STATUS_COVERED for b in r.branches)
+
+
+def test_exit_criteria_with_a_relative_date_are_evaluated_at_every_wait_end():
+    """The exit criteria are a clock site: their relative condition is evaluated at the end of each wait."""
+    acts = [wait_dur("WAIT-1", 2, "DAYS", "SPLIT-1"),
+            decision("SPLIT-1", "perm", [("a", "a", "UPD-1", cond("DE_Master", "Perm", "Is", "true"))], remainder_next="UPD-2"),
+            update("UPD-1", "1", [], None), update("UPD-2", "2", [], None)]
+    exits = [exit_filter("E1", rel("DE_Master", "EndDate", "Before", ";+;0;days"))]
+    engine, r = engine_run(acts, exits=exits)
+    assert engine.cut_points[END] == [2.0]
+    moments = dict((formula_text_of(f), m) for f, m in engine._contact_predicate_points())
+    assert moments["DE_Master.EndDate Before ';+;0;days'"] == ((2.0, ()),)   # the end of WAIT-1, 2 days in
+    assert r.exit_targets[0].status == STATUS_COVERED
+    leaving = next(c for c in r.cases if c.exit_by_criteria)
+    assert leaving.contact_values[END] is not None and leaving.contact_values[END] < day(2)
+    assert all(b.status == STATUS_COVERED for b in r.branches)
+
+
+# -- timeline, SMS, statistical cases --------------------------------------------------
+
+def test_cases_carry_timeline_and_sms():
+    acts = [decision("SPLIT-1", "perm", [("a", "a", "SMS-1", cond("DE_Master", "Perm", "Is", "true"))], remainder_next="UPD-2"),
+            sms("SMS-1", "Reminder", "WAIT-1"), wait_dur("WAIT-1", 2, "HOURS", "UPD-1"),
+            update("UPD-1", "1", [], None), update("UPD-2", "2", [], None)]
+    _, r = engine_run(acts)
+    texted = case_ending(r, "UPD-1")
+    assert texted.sms_sent == ["SMS-1"] and case_ending(r, "UPD-2").sms_sent == []
+    assert [(p.activity_key, p.at) for p in texted.timeline] == [
+        ("SPLIT-1", T0), ("SMS-1", T0), ("WAIT-1", T0 + timedelta(hours=2)), ("UPD-1", T0 + timedelta(hours=2))]
+    assert len(texted.timeline) == len(texted.steps)
+
+
+def test_statistical_case_timeline_and_branch_exits():
+    acts = [wait_dur("WAIT-0", 1, "DAYS", "RANDOM-1"),
+            random_split("RANDOM-1", [("branchResult-1", 90, "WAIT-1"), ("branchResult-2", 10, "UPD-2")]),
+            wait_dur("WAIT-1", 1, "DAYS", "UPD-1"), update("UPD-1", "1", [], None), update("UPD-2", "2", [], None)]
+    exits = [exit_filter("E1", cond("DE_Master", "IsDunning", "Is", "true"))]
+    _, r = engine_run(acts, exits=exits)
+    stat = next(c for c in r.cases if c.random is not None)
+    assert stat.timeline[-1] == TimelinePoint("RANDOM-1", None, T0 + timedelta(days=1))
+    assert [p.activity_key for p in stat.timeline] == [s.activity_key for s in stat.steps]
+    for branch in stat.random.branches:
+        assert len(branch.timeline) == len(branch.steps)
+        assert branch.exit_by_criteria is None
+    assert r.exit_targets[0].status == STATUS_COVERED
+
+
+def test_exit_criteria_on_a_scenario_level_field_branch_at_the_wait():
+    """The walker stops at the end of the wait on the undecided scenario field; the exploration branches on it."""
+    acts = [wait_dur("WAIT-1", 1, "DAYS", "SPLIT-1"),
+            decision("SPLIT-1", "perm", [("a", "a", "UPD-1", cond("DE_Master", "Perm", "Is", "true"))], remainder_next="UPD-2"),
+            update("UPD-1", "1", [], None), update("UPD-2", "2", [], None)]
+    _, r = engine_run(acts, (ENTRY, TIMED, CONFIG), exits=[exit_filter("E1", cond("DE_Config", "CG", "Is", "true"))],
+                      scenario=True)
+    assert r.scenario_fields == [("DE_Config", "CG")]
+    assert r.exit_targets[0].status == STATUS_COVERED and all(b.status == STATUS_COVERED for b in r.branches)
+    leaving = next(s for s in r.scenarios if any(c.exit_by_criteria for c in s.cases))
+    assert leaving.values[("DE_Config", "CG")] == "True"
+    assert all(s.values[("DE_Config", "CG")] == "False" for s in r.scenarios if s is not leaving)
+
+
+def test_classes_are_built_per_component_of_the_contact_fields():
+    """14 nullable Booleans in two independent components of 7 (each read by its own splits): 3**14 combinations,
+    more than the old cap on the whole product, which never let the first field leave its first value, so the
+    remainder of a split on A1 alone was lost. Per component, each product has 3**7 combinations: every class is
+    found and the member counts add up to the whole product."""
+    wide = table("DE_Master", [field("ContactId", pk=True, nullable=False)]
+                 + [field(f"{side}{i}", "Boolean") for side in "AB" for i in range(1, 8)], sendable_field="ContactId")
+    all_true = lambda side: AND(*[cond("DE_Master", f"{side}{i}", "Is", "true") for i in range(1, 8)])
+    acts = [decision("SPLIT-1", "all A", [("yes", "yes", "SPLIT-2", all_true("A"))], remainder_next="SPLIT-2"),
+            decision("SPLIT-2", "all B", [("yes", "yes", "SPLIT-3", all_true("B"))], remainder_next="SPLIT-3"),
+            decision("SPLIT-3", "A1", [("yes", "yes", "UPD-1", cond("DE_Master", "A1", "Is", "true"))], remainder_next="UPD-2"),
+            update("UPD-1", "1", [], None), update("UPD-2", "2", [], None)]
+    assert 3 ** 14 > coverage.MAX_CONTACT_COMBINATIONS
+    _, r = engine_run(acts, (ENTRY, wide))
+    assert r.stats["classes_incomplete"] == 0 and not any("combinazioni" in w for w in r.warnings)
+    assert len(r.classes) == 3 * 2 and sum(c.member_count for c in r.classes) == 3 ** 14
+    assert [c.id for c in r.classes] == list(range(1, 7))
+    assert all(b.status == STATUS_COVERED for b in r.branches)
+    # representatives keep the preference (no null) and every class holds every contact-level field, in order
+    assert all(list(c.values) == r.contact_fields and None not in c.values.values() for c in r.classes)
+    assert r.classes[0].values == {ref: "True" for ref in r.contact_fields}
+
+
+def _class_rows(result):
+    return [(c.id, c.values, c.predicate_truth, c.member_count) for c in result.classes]
+
+
+def test_large_components_are_enumerated_exactly_field_by_field(monkeypatch):
+    """A component over the cap is enumerated by prefixes that merge when their predicates have the same residual;
+    it gives the same classes (ids, representatives, truths, member counts) and cases as the full product."""
+    many = table("DE_Master", [field("ContactId", pk=True, nullable=False), field("StartDate", "Date")]
+                 + [field(f"F{i}", "Boolean") for i in range(1, 7)], sendable_field="ContactId")
+    f = lambda i, v="true": cond("DE_Master", f"F{i}", "Is", v)
+    acts = [decision("SPLIT-1", "mix", [("a", "a", "WAIT-1", AND(f(1), OR(f(2), f(3, "false")), rel("DE_Master", "StartDate", "After", ";+;0;days"))),
+                                        ("b", "b", "WAIT-1", OR(AND(f(4), f(5)), cond("DE_Master", "F6", "IsNull")))],
+                     remainder_next="WAIT-1"),
+            wait_dur("WAIT-1", 2, "DAYS", "SPLIT-2"),
+            decision("SPLIT-2", "later", [("a", "a", "UPD-1", AND(f(2), rel("DE_Master", "StartDate", "After", ";+;1;days")))],
+                     remainder_next="UPD-2"),
+            update("UPD-1", "1", [], None), update("UPD-2", "2", [], None)]
+    _, plain = engine_run(acts, (ENTRY, many))
+    monkeypatch.setattr(coverage, "MAX_CONTACT_COMBINATIONS", 10)
+    _, exact = engine_run(acts, (ENTRY, many))
+    assert exact.stats["classes_incomplete"] == 0 and not any("combinazioni" in w for w in exact.warnings)
+    assert _class_rows(exact) == _class_rows(plain)
+    assert [(c.id, c.contact_values, c.steps) for c in exact.cases] == [(c.id, c.contact_values, c.steps) for c in plain.cases]
+    assert sum(c.member_count for c in exact.classes) == 3 ** 6 * len(exact.domains[START])
+
+
+def test_a_component_over_the_cap_is_complete():
+    """13 Booleans read by one formula: 3**13 combinations in one component, more than the cap; the first and the
+    last field still take every value."""
+    wide = table("DE_Master", [field("ContactId", pk=True, nullable=False)]
+                 + [field(f"B{i}", "Boolean") for i in range(1, 14)], sendable_field="ContactId")
+    acts = [decision("SPLIT-1", "all", [("yes", "yes", "SPLIT-2", AND(*[cond("DE_Master", f"B{i}", "Is", "true") for i in range(1, 14)]))],
+                     remainder_next="SPLIT-2"),
+            decision("SPLIT-2", "first", [("yes", "yes", "SPLIT-3", cond("DE_Master", "B1", "Is", "true"))], remainder_next="SPLIT-3"),
+            decision("SPLIT-3", "last", [("yes", "yes", "UPD-1", cond("DE_Master", "B13", "Is", "true"))], remainder_next="UPD-2"),
+            update("UPD-1", "1", [], None), update("UPD-2", "2", [], None)]
+    assert 3 ** 13 > coverage.MAX_CONTACT_COMBINATIONS
+    _, r = engine_run(acts, (ENTRY, wide))
+    assert r.stats["classes_incomplete"] == 0
+    assert sum(c.member_count for c in r.classes) == 3 ** 13
+    assert len(r.classes) == 5      # all true; then B1 and B13 each true or not, with some other field not true
+    assert all(b.status == STATUS_COVERED for b in r.branches)
+
+
+def test_a_delay_only_other_values_reach_does_not_separate_a_class():
+    """ret_99_6w: SPLIT-2 is reached at once by the dates the window of SPLIT-1 lets through, and after a 3-day wait
+    by the others. Evaluated at every fixed delay, T0+30 and T0+31 differ at the 3-day delay ("on or after Today +
+    28" three days later), a delay no contact holding them reaches; on their own paths they take the same branches,
+    so they are one class, and the value kept is not on a cut point and lasts longest (T0+33, 3 days)."""
+    acts = [decision("SPLIT-1", "window", [("path_a", "in", "SPLIT-2", rel("DE_Master", "EndDate", "AtOrAfter", ";+;30;days"))],
+                     remainder_next="WAIT-1"),
+            wait_dur("WAIT-1", 3, "DAYS", "SPLIT-2"),
+            decision("SPLIT-2", "still", [("path_a", "in", "UPD-1", rel("DE_Master", "EndDate", "AtOrAfter", ";+;28;days"))],
+                     remainder_next="UPD-2"),
+            update("UPD-1", "1", [], None), update("UPD-2", "2", [], None)]
+    engine, r = engine_run(acts)
+    assert engine.cut_points[END] == [28.0, 30.0, 31.0]
+    points = engine._clock_points(END)
+    assert engine._clock_vector(points, day(30)) != engine._clock_vector(points, day(31))
+    intern = {}
+    assert engine._behaviour(END, day(30), 0, intern) == engine._behaviour(END, day(31), 0, intern)
+    assert r.domains[END] == [day(26), day(33)]
+    assert engine.validity[END] == {day(26): None, day(33): 3}
+    assert all(b.status == STATUS_COVERED for b in r.branches)       # the remainder of SPLIT-2 by T0+26, after the wait
+    assert r.validity_days == 3
+    assert_validity_matches_simulation(engine, END)
+
+
+def _perishable_exit_journey(with_flag: bool):
+    """SPLIT-1 at entry: "EndDate on or after Today + 13"; both branches then wait one day. The exit criteria take
+    out the contacts whose EndDate is exactly 7 days after the wait's end (T0+8, valid 0 days); with the flag, also
+    the flagged contacts of path_a (a value that lasts)."""
+    on_day_8 = AND(rel("DE_Master", "EndDate", "After", ";+;6;days"), rel("DE_Master", "EndDate", "Before", ";+;8;days"))
+    formula = OR(on_day_8, AND(cond("DE_Master", "Perm", "Is", "true"), rel("DE_Master", "EndDate", "AtOrAfter", ";+;13;days"))) \
+        if with_flag else on_day_8
+    acts = [decision("SPLIT-1", "far", [("path_a", "far", "WAIT-2", rel("DE_Master", "EndDate", "AtOrAfter", ";+;13;days"))],
+                     remainder_next="WAIT-1"),
+            wait_dur("WAIT-1", 1, "DAYS", "UPD-2"), wait_dur("WAIT-2", 1, "DAYS", "UPD-1"),
+            update("UPD-1", "1", [], None), update("UPD-2", "2", [], None)]
+    return acts, [exit_filter("E1", formula)]
+
+
+def test_perishable_leaves_do_not_displace_robust_ones():
+    """A leaf holding a value valid for fewer days than the minimum counts in the cover only for the targets no
+    leaf without such a value reaches: here the remainder and the exit are reached by values that last, so the
+    T0+8 contacts are left out and the data stays valid at least one day."""
+    acts, exits = _perishable_exit_journey(with_flag=True)
+    engine, r = engine_run(acts, exits=exits)
+    assert engine.validity[END][day(8)] == 0
+    det = [leaf for leaf in engine.leaves if leaf.deterministic]
+    masks = engine._effective_masks(det)
+    short = [leaf for leaf in det if engine.classes[leaf.class_id - 1].values[END] == day(8)]
+    assert short and all(engine._leaf_is_short(leaf) and masks[leaf.id] == 0 for leaf in short)
+    assert all(c.contact_values[END] != day(8) for c in r.cases)
+    assert all(b.status == STATUS_COVERED for b in r.branches) and r.exit_targets[0].status == STATUS_COVERED
+    assert r.validity_days is not None and r.validity_days >= 1
+
+
+def test_a_perishable_leaf_is_kept_for_a_target_only_it_reaches():
+    acts, exits = _perishable_exit_journey(with_flag=False)
+    _, r = engine_run(acts, exits=exits)
+    leaving = next(c for c in r.cases if c.exit_by_criteria)
+    assert leaving.contact_values[END] == day(8) and leaving.validity_days == 0
+    assert r.exit_targets[0].status == STATUS_COVERED and r.validity_days == 0
+    assert any("resta valido solo 0 giorni" in w for w in r.warnings)

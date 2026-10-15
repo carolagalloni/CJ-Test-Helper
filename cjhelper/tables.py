@@ -36,6 +36,29 @@ Rules of the spec section "Extensions beyond the pilot (agreed 12 October 2026)"
 - Missing relationship: a table read through an attribute set that no relationship of the export names
   (``Package.missing_relationships``) is not linked to the contact; its reason says so.
 
+Rules of the spec section "Extensions for time-dependent journeys (step 3, 14 October 2026)":
+
+- "Tables reached through other tables": "Every table on the path from the contact to a read table is a
+  **link table**: it gets a CSV, with the role 'link', because without its rows the journey cannot read the
+  table at the end of the path." The path is ``Condition.path`` and ``Activity.wait_path`` (table names,
+  nearest the contact first, filled by loader.py). "Levels keep the rule of Classify fields by level": the
+  link tables only make the key groups reach the table at the end of the path. "When the export gives no
+  path for a read table that no selected table joins, the generator looks for the shortest chain of
+  relationships from the contact to it and uses it with a warning; with no chain at all, the earlier rule
+  applies (one row shared by all contacts, assumption)."
+- "Columns the entry query derives and columns it copies": "A column of the entry table copied as a plain
+  column from a source table ... holds the same value as its source: the two fields are one variable ...
+  The same holds through a chain of followed queries." Those groups are ``TableModel.aliases``; copies of
+  key fields stay in the key groups.
+- "A LEFT JOIN source still gets one row per contact (read as an inner join, as before); the report says
+  so": the source keeps its CSV and its reason says so.
+- "Synchronized data extensions": a managed table keeps its CSV; its reason says that it is synchronized from
+  the CRM and that the CSV is imported like the others.
+- A ``DateOffsetFilter`` of the entry query is never an activation field (only equality filters are).
+- "Exit criteria and goals": the exit criteria the generator evaluates (``graph.evaluable_exits``) read their
+  tables at the end of every wait, as a split does, so their tables count as split tables (decision of the
+  team, 14 October 2026: they get a CSV, and their paths make link tables).
+
 The SQL is read through ``sqlparse_lite.parse_query``; this module only looks at the parsed form.
 Every decision is explained in ``TableRole.reason`` or in ``TableModel.warnings``, in plain words.
 The parser warnings of the queries followed are repeated in ``TableModel.warnings``, prefixed
@@ -45,6 +68,15 @@ Readings of the spec that are not spelled out there (each is visible in a reason
 
 - ``ROLE_WRITTEN`` is the spec's "written-only" role: a table that is read keeps only its
   reading roles, and its reason says it is also written.
+- ``ROLE_LINK`` in the same way: a link table that is also the entry, a split or a source table keeps
+  those roles only, and its reason says it is on the path (so the pilot keeps its roles).
+- The conditions of every outcome name their path, also the outcomes the walk never evaluates (behind an
+  unsupported one): their tables are split tables and get a CSV, so the tables leading to them are link
+  tables too.
+- The chain of relationships inferred for a table no level reaches starts at any table holding a field of
+  the contact key's group (a group-to-set link counts as "from the contact"); the relationships between two
+  tables are followed both ways. Every table on the chain before the read table is on its path; those
+  without a CSV become link tables.
 - A selected table that is not joined to the entry is scenario-level: one row shared by all
   contacts (warning).
 - A table joined to the entry on the contact key is contact-level even when it is also joined to
@@ -63,7 +95,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional
 
-from . import sqlparse_lite
+from . import graph, sqlparse_lite
 from .model import (
     ENTRY_AUTOMATION,
     KIND_DECISION,
@@ -71,11 +103,13 @@ from .model import (
     LEVEL_CONTACT,
     LEVEL_SCENARIO,
     ROLE_ENTRY,
+    ROLE_LINK,
     ROLE_SOURCE,
     ROLE_SPLIT,
     ROLE_WRITTEN,
     SOURCE_JOURNEY,
     ColumnRef,
+    Condition,
     EqualityFilter,
     FieldRef,
     KeyGroup,
@@ -85,6 +119,7 @@ from .model import (
     SelectColumn,
     Table,
     TableModel,
+    TableRef,
     TableRole,
     formula_conditions,
 )
@@ -95,9 +130,20 @@ GROUP_SCENARIO = "scenario"
 GROUP_OTHER = "other"
 
 # A table with one of these roles is read by the journey, so it gets a CSV.
-READING_ROLES = frozenset({ROLE_ENTRY, ROLE_SPLIT, ROLE_SOURCE})
+READING_ROLES = frozenset({ROLE_ENTRY, ROLE_SPLIT, ROLE_SOURCE, ROLE_LINK})
+
+# Who reads a table directly: a decision split, a wait by attribute, an exit criterion of the journey.
+READ_SPLIT = "split"
+READ_WAIT = "wait"
+READ_EXIT = "exit"
+# Up to this many readers are named by key in a reason; above it they are counted by kind.
+READERS_NAMED = 5
 
 NO_ROLE_REASON = "Né letta né scritta da questo journey."
+INFERRED_PATH = "percorso dedotto dalle relazioni dell'export, non indicato dallo split"
+LEFT_JOIN_NOTE = "Unita con LEFT JOIN: le righe generate la trattano come inner join."
+MANAGED_NOTE = ("Data extension sincronizzata dal CRM: il CSV si importa come gli altri e le righe arriveranno "
+                "anche dalla sincronizzazione.")
 
 
 def build_table_model(package: Package) -> TableModel:
@@ -107,11 +153,15 @@ def build_table_model(package: Package) -> TableModel:
 
     1. the entry table and the query that fills it (the entry query);
     2. who reads each table (splits, waits by attribute, the queries followed back from the entry
-       query) and who writes it (update contact steps, queries);
-    3. roles and selection: the entry, split and source tables get a CSV, the others do not;
+       query), who writes it (update contact steps, queries) and which tables are on the path from the
+       contact to a table a split or a wait reads (step 3, link tables);
+    3. roles and selection: the entry, split, source and link tables get a CSV, the others do not;
     4. the contact key field, then the key groups;
-    5. the level of each selected table, then the kind of each key group, then the level of each field;
-    6. the activation field suggested from the entry query filters.
+    5. the tables no level reaches get the shortest chain of relationships from the contact, when there
+       is one: its tables become link tables, and the roles and the selection are made again with them;
+    6. the level of each selected table, then the kind of each key group, then the level of each field;
+    7. the activation field suggested from the entry query filters, the tables whose existence a split
+       tests, the columns the followed queries copy (aliases).
     """
     warnings: list[str] = []
     names = _Names(package.tables)
@@ -130,29 +180,36 @@ def build_table_model(package: Package) -> TableModel:
     _record_writes(package, names, uses)
 
     order = _table_order(package.tables, entry)
-    roles = {name: _roles(name, entry, uses[name]) for name in order}
-    selected = [name for name in order if roles[name] & READING_ROLES]
+    roles, selected = _selection(order, entry, uses)
 
     contact_key = _contact_key_field(package, entry, names, warnings)
     keys = _link_keys(contact_key, package, source_queries, names, warnings)
     unlinked = {name for name in (names.table(t) for t in package.missing_relationships) if name}
+    chains = _inferred_links(package, names, keys, contact_key, entry, order, selected, unlinked)
+    if chains:
+        _record_inferred_links(chains, uses, warnings)
+        roles, selected = _selection(order, entry, uses)
+
     levels, level_reasons = _table_levels(entry, selected, package.tables, keys, contact_key, warnings, unlinked)
     key_groups = _key_groups(keys, contact_key, levels, entry, selected, package.tables)
     field_levels = _field_levels(selected, package.tables, levels, key_groups, entry, entry_parsed, names)
     activation, activation_note = _activation_field(entry_parsed, levels, names, warnings)
     existence, existence_splits = _existence_tested(package, entry, roles, levels, keys, contact_key, names)
+    aliases = _aliases(source_queries, names, key_groups, selected, order, package.tables)
 
     entry_query_name = entry_query.name if entry_query else None
     table_roles: dict[str, TableRole] = {}
     for name in order:
         is_selected = name in selected
         if is_selected:
-            note = activation_note if activation and activation[0] == name else ""
-            if name in existence:
-                note = " ".join(part for part in (note, _existence_note(existence[name], existence_splits[name]))
-                                if part)
+            notes = [
+                LEFT_JOIN_NOTE if ROLE_SOURCE in roles[name] and uses[name].left_joins else "",
+                MANAGED_NOTE if package.tables[name].managed else "",
+                activation_note if activation and activation[0] == name else "",
+                _existence_note(existence[name], existence_splits[name]) if name in existence else "",
+            ]
             reason = _selected_reason(roles[name], uses[name], entry_query_name,
-                                      levels[name], level_reasons[name], note)
+                                      levels[name], level_reasons[name], notes)
         elif ROLE_WRITTEN in roles[name]:
             reason = f"Scritta {_writers_text(uses[name])}, mai letta da uno split o dalla entry query: nessun CSV."
         else:
@@ -173,6 +230,7 @@ def build_table_model(package: Package) -> TableModel:
         activation_field=activation,
         warnings=list(dict.fromkeys(warnings)),
         existence_tested=existence,
+        aliases=aliases,
     )
 
 
@@ -351,10 +409,24 @@ class _Use:
     """Who reads and who writes one table: the facts behind its roles and its reason."""
     splits: list[str] = field(default_factory=list)              # decision splits naming it in a condition
     waits: list[str] = field(default_factory=list)               # waits by attribute on one of its fields
+    exits: list[str] = field(default_factory=list)               # evaluable exit criteria naming it
     read_by_query: Optional[str] = None                          # the followed query that first read it
     query_fills: Optional[str] = None                            # the table that query fills
     update_steps: list[str] = field(default_factory=list)        # update contact steps writing it
     written_by_queries: list[str] = field(default_factory=list)  # queries whose target it is
+    # On the path from the contact to these read tables: read table -> who reads it that way, as
+    # (READ_SPLIT / READ_WAIT / READ_EXIT, activity or exit criterion key), in order of first read.
+    link_for: dict[str, list[tuple[str, str]]] = field(default_factory=dict)
+    inferred_links: set[str] = field(default_factory=set)        # read tables of link_for whose path was inferred
+    left_joins: list[str] = field(default_factory=list)          # followed queries reading it with a LEFT JOIN
+
+    def readers(self) -> list[tuple[str, str]]:
+        """Who reads this table directly, as in ``link_for``: splits, then waits, then exit criteria."""
+        return ([(READ_SPLIT, key) for key in self.splits] + [(READ_WAIT, key) for key in self.waits]
+                + [(READ_EXIT, key) for key in self.exits])
+
+    def read_list(self, kind: str) -> list[str]:
+        return {READ_SPLIT: self.splits, READ_WAIT: self.waits, READ_EXIT: self.exits}[kind]
 
 
 def _record_split_reads(package: Package, names: _Names, uses: dict[str, _Use], warnings: list[str]) -> None:
@@ -362,32 +434,61 @@ def _record_split_reads(package: Package, names: _Names, uses: dict[str, _Use], 
 
     The tables come from every condition of every decision outcome formula and from the date
     field of every wait-by-attribute. A table or field that is not in the export is reported.
+
+    Spec, step 3, "Exit criteria and goals": the exit criteria the generator evaluates
+    (``graph.evaluable_exits``) read their conditions at the end of every wait, as a split does, so the
+    tables they name count as split tables (team decision); the others are not modelled and read nothing.
+
+    Spec, step 3, "Tables reached through other tables": "Every table on the path from the contact to a
+    read table is a link table". The path of a condition is ``Condition.path`` (Journey Data reads the
+    entry row: no path), the path of a wait ``Activity.wait_path``; each of its tables records a link use
+    (``_Use.link_for``: the read table and its reader). A path table that is not in the export is reported.
     """
-    reads: list[tuple[str, bool, str, str]] = []   # (activity key, is a wait, table, field) as written
+    reads: list[tuple[str, str, str, str, tuple[str, ...]]] = []   # (reader kind, key, table, field, path)
+
+    def read_condition(kind: str, key: str, condition: Condition) -> None:
+        if condition.source == SOURCE_JOURNEY:
+            if names.table(condition.table) is not None:   # Journey Data of another entry event names no table
+                reads.append((kind, key, condition.table, condition.field, ()))
+        else:
+            reads.append((kind, key, condition.table, condition.field, condition.path))
+
     for activity in package.journey.activities.values():
         for outcome in activity.outcomes:
             for condition in formula_conditions(outcome.formula):
-                if condition.source == SOURCE_JOURNEY and names.table(condition.table) is None:
-                    continue   # Journey Data of another entry event: names no table (loader.py reports it)
-                reads.append((activity.key, False, condition.table, condition.field))
+                read_condition(READ_SPLIT, activity.key, condition)
         if activity.kind == KIND_WAIT_ATTRIBUTE and activity.wait_field:
-            reads.append((activity.key, True, activity.wait_field[0], activity.wait_field[1]))
+            reads.append((READ_WAIT, activity.key, activity.wait_field[0], activity.wait_field[1],
+                          activity.wait_path))
+    for exit_ in graph.evaluable_exits(package.journey):
+        for condition in formula_conditions(exit_.formula):
+            read_condition(READ_EXIT, exit_.key, condition)
 
     unknown_tables: dict[str, list[str]] = {}
     unknown_fields: dict[str, list[str]] = {}
-    for activity_key, is_wait, table_name, field_name in reads:
+    unknown_links: dict[tuple[str, str], list[str]] = {}
+    for kind, key, table_name, field_name, path in reads:
         table = names.table(table_name)
         if table is None:
-            _add_once(unknown_tables.setdefault(table_name, []), activity_key)
+            _add_once(unknown_tables.setdefault(table_name, []), key)
             continue
-        _add_once(uses[table].waits if is_wait else uses[table].splits, activity_key)
+        _add_once(uses[table].read_list(kind), key)
         if names.field_ref(table, field_name) is None:
-            _add_once(unknown_fields.setdefault(f"{table}.{field_name}", []), activity_key)
+            _add_once(unknown_fields.setdefault(f"{table}.{field_name}", []), key)
+        for link_name in path:
+            link = names.table(link_name)
+            if link is None:
+                _add_once(unknown_links.setdefault((link_name, table), []), key)
+            elif link != table:
+                _add_once(uses[link].link_for.setdefault(table, []), (kind, key))
     for table_name, keys in unknown_tables.items():
         warnings.append(f"La tabella {table_name} è letta da {_short_list(keys)} ma non è nell'export: "
                         "non è possibile crearne il CSV")
     for ref_text, keys in unknown_fields.items():
         warnings.append(f"{ref_text} è letto da {_short_list(keys)} ma non è un campo dell'export")
+    for (link_name, table), keys in unknown_links.items():
+        warnings.append(f"La tabella {link_name}, sul percorso tra il contatto e {table} letta da {_short_list(keys)}, "
+                        "non è nell'export: non è possibile crearne il CSV")
 
 
 def _follow_sources(package: Package, entry: str, entry_query: Optional[Query], entry_queries: list[Query],
@@ -413,14 +514,16 @@ def _follow_sources(package: Package, entry: str, entry_query: Optional[Query], 
     followed = [parse(q) for q in starting]
     done_queries = {q.name for q in starting}
     done_tables = {entry}
-    pending = deque((ref.table, parsed) for parsed in followed for ref in parsed.sources)
+    pending: deque[tuple[TableRef, ParsedQuery]] = deque((ref, parsed) for parsed in followed for ref in parsed.sources)
     while pending:
-        table_name, reader = pending.popleft()
-        table = names.table(table_name)
+        ref, reader = pending.popleft()
+        table = names.table(ref.table)
         if table is None:
-            warnings.append(f"Query {reader.name}: la tabella {table_name}, letta dalla query, non è nell'export, "
+            warnings.append(f"Query {reader.name}: la tabella {ref.table}, letta dalla query, non è nell'export, "
                             "quindi non è possibile crearne il CSV")
             continue
+        if ref.optional and table != entry:
+            _add_once(uses[table].left_joins, reader.name)   # spec, step 3: "A LEFT JOIN source ... the report says so"
         if table in done_tables:
             continue
         done_tables.add(table)
@@ -432,7 +535,7 @@ def _follow_sources(package: Package, entry: str, entry_query: Optional[Query], 
             done_queries.add(query.name)
             parsed = parse(query)
             followed.append(parsed)
-            pending.extend((ref.table, parsed) for ref in parsed.sources)
+            pending.extend((source, parsed) for source in parsed.sources)
     return followed
 
 
@@ -456,17 +559,30 @@ def _record_writes(package: Package, names: _Names, uses: dict[str, _Use]) -> No
 def _roles(name: str, entry: str, use: _Use) -> set[str]:
     """Spec "Table selection": entry, split and source tables are read; a table that is only
     written is the spec's "written-only table" (``ROLE_WRITTEN``). A table that is read and also
-    written keeps its reading roles only; its reason says it is also written."""
+    written keeps its reading roles only; its reason says it is also written.
+
+    Spec, step 3, "Tables reached through other tables": a table on the path from the contact to a read
+    table is a link table (``ROLE_LINK``), which gets a CSV. A link table that is also the entry, a split or
+    a source table keeps those roles only; its reason says it is on the path. A table read by an evaluable
+    exit criterion is a split table (team decision, see ``_record_split_reads``)."""
     roles: set[str] = set()
     if name == entry:
         roles.add(ROLE_ENTRY)
-    if use.splits or use.waits:
+    if use.splits or use.waits or use.exits:
         roles.add(ROLE_SPLIT)
     if use.read_by_query:
         roles.add(ROLE_SOURCE)
+    if not roles and use.link_for:
+        roles.add(ROLE_LINK)
     if not roles and (use.update_steps or use.written_by_queries):
         roles.add(ROLE_WRITTEN)
     return roles
+
+
+def _selection(order: list[str], entry: str, uses: dict[str, _Use]) -> tuple[dict[str, set[str]], list[str]]:
+    """The roles of every table and the tables that get a CSV (a reading role), in ``order``."""
+    roles = {name: _roles(name, entry, uses[name]) for name in order}
+    return roles, [name for name in order if roles[name] & READING_ROLES]
 
 
 # ---------------------------------------------------------------------------
@@ -652,6 +768,87 @@ def _select_copies(source_queries: list[ParsedQuery], names: _Names) -> list[tup
 
 
 # ---------------------------------------------------------------------------
+# Paths inferred from the relationships
+# ---------------------------------------------------------------------------
+
+def _inferred_links(package: Package, names: _Names, keys: _KeyUnion, contact_key: FieldRef, entry: str,
+                    order: list[str], selected: list[str], unlinked: set[str]) -> dict[str, list[str]]:
+    """Spec, step 3, "Tables reached through other tables": "When the export gives no path for a read table
+    that no selected table joins, the generator looks for the shortest chain of relationships from the
+    contact to it and uses it with a warning; with no chain at all, the earlier rule applies".
+
+    The read tables are the selected tables that the level walk does not reach, other than those whose
+    attribute set has no relationship in the export (``unlinked``: their reason says so already). The chain
+    starts at any table holding a field of the contact key's group, which a group-to-set link puts there
+    ("from the contact"); it follows the relationships between two tables, both ways (``model.Relationship``),
+    breadth-first, the tables with a CSV first, so a shortest chain is found and ties keep the export order.
+
+    Returns read table -> the tables of its chain between the contact and it, nearest the contact first.
+    A read table with no chain is left out.
+    """
+    reached, _ = _reached_levels(entry, selected, package.tables, keys, contact_key)
+    targets = [name for name in selected if name not in reached and name not in unlinked]
+    if not targets:
+        return {}
+    contact_root = keys.find(contact_key)
+    selected_set = set(selected)
+    starts = [name for name in order
+              if any(ref in keys and keys.find(ref) == contact_root
+                     for ref in ((name, f.name) for f in package.tables[name].fields))]
+    starts.sort(key=lambda name: name not in selected_set)   # stable: the tables with a CSV first
+    neighbours = _relationship_neighbours(package, names)
+    parent: dict[str, Optional[str]] = {name: None for name in starts}
+    queue = deque(starts)
+    while queue:
+        current = queue.popleft()
+        for other in neighbours.get(current, []):
+            if other not in parent:
+                parent[other] = current
+                queue.append(other)
+    chains: dict[str, list[str]] = {}
+    for target in targets:
+        if target not in parent:
+            continue
+        chain: list[str] = []
+        step = parent[target]
+        while step is not None:
+            chain.append(step)
+            step = parent[step]
+        chains[target] = chain[::-1]
+    return chains
+
+
+def _relationship_neighbours(package: Package, names: _Names) -> dict[str, list[str]]:
+    """Table -> the tables a relationship of the export links it to, both ways, in export order. Group-to-set
+    relationships (the contact) and relationships with a side that is not in the export are left out."""
+    neighbours: dict[str, list[str]] = {}
+    for rel in package.relationships:
+        if rel.left_table is None:
+            continue
+        left = names.field_ref(rel.left_table, rel.left_field)
+        right = names.field_ref(rel.right_table, rel.right_field)
+        if left is None or right is None or left[0] == right[0]:
+            continue
+        _add_once(neighbours.setdefault(left[0], []), right[0])
+        _add_once(neighbours.setdefault(right[0], []), left[0])
+    return neighbours
+
+
+def _record_inferred_links(chains: dict[str, list[str]], uses: dict[str, _Use], warnings: list[str]) -> None:
+    """Every table of an inferred chain is on the path to its read table, as if the export named the path
+    (the tables without a CSV become link tables); one warning per read table says the path was inferred."""
+    for target, chain in chains.items():
+        readers = uses[target].readers()
+        for name in chain:
+            link = uses[name].link_for.setdefault(target, [])
+            for reader in readers:
+                _add_once(link, reader)
+            uses[name].inferred_links.add(target)
+        warnings.append(f"La tabella {target} è raggiunta dal contatto attraverso {_join_words(chain)} "
+                        f"({INFERRED_PATH})")
+
+
+# ---------------------------------------------------------------------------
 # Levels
 # ---------------------------------------------------------------------------
 
@@ -676,10 +873,36 @@ def _table_levels(entry: str, selected: list[str], tables: dict[str, Table], key
       so instead: the splits reading it are unsupported, so its rows only fill the CSV.
 
     Only selected tables get a level, but the groups were built over every table, so a link that
-    passes through a table without a CSV still counts.
+    passes through a table without a CSV still counts. The link tables of the step 3 extension are
+    selected, so the walk reaches the table at the end of their path (spec, step 3: "the link table joined
+    on the contact key is contact-level, the table it points to through another field is scenario-level").
 
     Returns the level of each selected table and the plain-words reason for it.
     """
+    levels, reasons = _reached_levels(entry, selected, tables, keys, contact_key)
+    for name in selected:
+        if name not in levels and name in unlinked:
+            levels[name] = LEVEL_SCENARIO
+            reasons[name] = ("il suo attribute set non ha alcuna relazione nell'export (relazione mancante "
+                             "nell'export), quindi non si sa come è collegata al contatto: gli split che la leggono "
+                             "sono non supportati")
+            warnings.append(f"La tabella {name} è letta da uno split tramite un attribute set che non ha alcuna "
+                            "relazione nell'export (relazione mancante nell'export): le condizioni su questa tabella "
+                            "sono non supportate e le sue righe non sono collegate ai contatti")
+        elif name not in levels:
+            levels[name] = LEVEL_SCENARIO
+            reasons[name] = ("non collegata alla tabella di ingresso: trattata come una riga condivisa da tutti i "
+                             "contatti (assunzione)")
+            warnings.append(f"La tabella {name} non è collegata alla tabella di ingresso: è trattata come una riga "
+                            "condivisa da tutti i contatti (a livello di scenario). È un'assunzione: verifica come il "
+                            "journey collega questa tabella")
+    return levels, reasons
+
+
+def _reached_levels(entry: str, selected: list[str], tables: dict[str, Table], keys: _KeyUnion,
+                    contact_key: FieldRef) -> tuple[dict[str, str], dict[str, str]]:
+    """The walk of ``_table_levels`` over the key groups: the level and its reason for every selected
+    table it reaches. The tables it does not reach are missing from the result."""
     members = _group_members(keys, selected, tables)
     contact_root = keys.find(contact_key)
     levels = {entry: LEVEL_CONTACT}
@@ -702,23 +925,6 @@ def _table_levels(entry: str, selected: list[str], tables: dict[str, Table], key
                 reasons[other] = (f"collegata tramite {current}.{tables_in_group[current]} = {other}.{other_field}, "
                                   "non tramite la chiave del contatto, quindi più contatti condividono una riga")
                 queue.append(other)
-
-    for name in selected:
-        if name not in levels and name in unlinked:
-            levels[name] = LEVEL_SCENARIO
-            reasons[name] = ("il suo attribute set non ha alcuna relazione nell'export (relazione mancante "
-                             "nell'export), quindi non si sa come è collegata al contatto: gli split che la leggono "
-                             "sono non supportati")
-            warnings.append(f"La tabella {name} è letta da uno split tramite un attribute set che non ha alcuna "
-                            "relazione nell'export (relazione mancante nell'export): le condizioni su questa tabella "
-                            "sono non supportate e le sue righe non sono collegate ai contatti")
-        elif name not in levels:
-            levels[name] = LEVEL_SCENARIO
-            reasons[name] = ("non collegata alla tabella di ingresso: trattata come una riga condivisa da tutti i "
-                             "contatti (assunzione)")
-            warnings.append(f"La tabella {name} non è collegata alla tabella di ingresso: è trattata come una riga "
-                            "condivisa da tutti i contatti (a livello di scenario). È un'assunzione: verifica come il "
-                            "journey collega questa tabella")
     return levels, reasons
 
 
@@ -801,6 +1007,39 @@ def _field_levels(selected: list[str], tables: dict[str, Table], levels: dict[st
 
 
 # ---------------------------------------------------------------------------
+# Columns copied by the followed queries
+# ---------------------------------------------------------------------------
+
+def _aliases(source_queries: list[ParsedQuery], names: _Names, key_groups: list[KeyGroup], selected: list[str],
+             order: list[str], tables: dict[str, Table]) -> list[list[FieldRef]]:
+    """Spec, step 3, "Columns the entry query derives and columns it copies": "A column of the entry table
+    copied as a plain column from a source table (M.Entitle_RequestCancellationDate) holds the same value as
+    its source: the two fields are one variable for the coverage (as the key groups are for keys) ... The
+    same holds through a chain of followed queries."
+
+    The plain column copies of every followed query (``SelectColumn`` only: never a literal or an
+    expression) are grouped, through chains, when both tables get a CSV and neither field is in a key group:
+    the copies of keys are already in the key groups (``_link_keys``). Each group lists its fields in schema
+    order (table order of the model, then the field's position); the groups follow their first field.
+    """
+    key_fields = {ref for group in key_groups for ref in group.fields}
+    selected_set = set(selected)
+    union = _KeyUnion()
+    for source, target in _select_copies(source_queries, names):
+        if source in key_fields or target in key_fields:
+            continue
+        if source[0] in selected_set and target[0] in selected_set:
+            union.union(source, target)
+    position = {name: index for index, name in enumerate(order)}
+
+    def schema_order(ref: FieldRef) -> tuple[int, int]:
+        return position[ref[0]], tables[ref[0]].field_names.index(ref[1])
+
+    groups = [sorted(refs, key=schema_order) for refs in union.groups()]
+    return sorted(groups, key=lambda refs: schema_order(refs[0]))
+
+
+# ---------------------------------------------------------------------------
 # Row present or absent
 # ---------------------------------------------------------------------------
 
@@ -863,8 +1102,9 @@ def _activation_field(entry_parsed: Optional[ParsedQuery], levels: dict[str, str
     (ACTIVE in the pilot)".
 
     The suggestion is the first equality filter of the entry query on a Boolean field (per schema) of
-    a scenario-level table whose value is true, e.g. ``C.active = 'True'``. Returns the field in the
-    schema spelling, or None, and a sentence for the table's reason.
+    a scenario-level table whose value is true, e.g. ``C.active = 'True'``. Any other filter is not an
+    activation field, a ``DateOffsetFilter`` (the date part equal to today moved by some days) included.
+    Returns the field in the schema spelling, or None, and a sentence for the table's reason.
     """
     if entry_parsed is None:
         return None, ""
@@ -896,9 +1136,12 @@ def _activation_field(entry_parsed: Optional[ParsedQuery], levels: dict[str, str
 # ---------------------------------------------------------------------------
 
 def _selected_reason(roles: set[str], use: _Use, entry_query_name: Optional[str], level: str,
-                     level_reason: str, activation_note: str) -> str:
-    """Plain words for a table that gets a CSV: who reads it, who else writes it, and its level."""
+                     level_reason: str, notes: list[str]) -> str:
+    """Plain words for a table that gets a CSV: who reads it, who else writes it, the paths it is on
+    (step 3, link tables), its level, then ``notes`` (LEFT JOIN, managed table, activation field, row
+    present or absent)."""
     reads = _reads_text(use, entry_query_name)
+    link = _link_text(use)
     if ROLE_ENTRY in roles:
         if entry_query_name:
             text = f"Tabella di ingresso del journey, popolata dalla entry query {entry_query_name}"
@@ -907,16 +1150,49 @@ def _selected_reason(roles: set[str], use: _Use, entry_query_name: Optional[str]
         if reads:
             text += f"; letta anche {_join_words(reads)}"
         writers = _writers_text(use, skip_query=entry_query_name)
-    else:
+    elif reads:
         text = f"Letta {_join_words(reads)}"
+        writers = _writers_text(use)
+    else:   # a link table only: the path is what it is read for
+        text, link = link[0].upper() + link[1:], ""
         writers = _writers_text(use)
     if writers:
         text += f"; scritta anche {writers}"
     level_name = "A livello di contatto" if level == LEVEL_CONTACT else "A livello di scenario"
-    parts = [f"{text}.", f"{level_name}: {level_reason}."]
-    if activation_note:
-        parts.append(activation_note)
+    parts = [f"{text}."]
+    if link:
+        parts.append(f"È anche {link}.")
+    parts.append(f"{level_name}: {level_reason}.")
+    parts.extend(note for note in notes if note)
     return " ".join(parts)
+
+
+def _link_text(use: _Use) -> str:
+    """Spec, step 3: a link table is needed "because without its rows the journey cannot read the table at
+    the end of the path". The clause ``"sul percorso tra il contatto e X letta da SPLIT-1: senza le sue righe
+    il journey non può leggere X"``, empty when the table is on no path."""
+    if not use.link_for:
+        return ""
+    parts: list[str] = []
+    for table, readers in use.link_for.items():
+        part = f"{table} letta da {_readers_text(readers)}" if readers else table
+        if table in use.inferred_links:
+            part += f" ({INFERRED_PATH})"
+        parts.append(part)
+    return (f"sul percorso tra il contatto e {', e tra il contatto e '.join(parts)}: senza le sue righe il journey "
+            f"non può leggere {_join_words(list(use.link_for))}")
+
+
+def _readers_text(readers: list[tuple[str, str]]) -> str:
+    """The readers of a table on a path: their keys when they are few (``SPLIT-1 e WAIT-1``), else a count
+    by kind (``62 split e 3 Wait by attribute``)."""
+    if len(readers) <= READERS_NAMED:
+        return _join_words([key for _, key in readers])
+    counts = {kind: sum(1 for reader_kind, _ in readers if reader_kind == kind)
+              for kind in (READ_SPLIT, READ_WAIT, READ_EXIT)}
+    words = {READ_SPLIT: ("split", "split"), READ_WAIT: ("Wait by attribute", "Wait by attribute"),
+             READ_EXIT: ("criterio di uscita", "criteri di uscita")}
+    return _join_words([_count(n, *words[kind]) for kind, n in counts.items() if n])
 
 
 def _reads_text(use: _Use, entry_query_name: Optional[str]) -> list[str]:
@@ -925,6 +1201,8 @@ def _reads_text(use: _Use, entry_query_name: Optional[str]) -> list[str]:
         phrases.append("da " + _count(len(use.splits), "split", "split"))
     if use.waits:
         phrases.append("da " + _count(len(use.waits), "Wait by attribute", "Wait by attribute"))
+    if use.exits:
+        phrases.append("dai criteri di uscita (exit criteria)")
     if use.read_by_query:
         if use.read_by_query == entry_query_name:
             phrases.append(f"dalla entry query {use.read_by_query}")

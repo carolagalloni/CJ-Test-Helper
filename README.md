@@ -29,7 +29,7 @@ Il comando stampa un riepilogo e l'esito di ogni trust check. Quando elementi no
 | `--out FOLDER` | Dove scrivere i file. Default `output`. |
 | `--run-id R01` | Run identifier aggiunto a ogni chiave, come in `TST_R01_C0001`. Default `R01`. |
 | `--inbox ADDRESS` | Inbox reale per i contatti che devono aprire o cliccare un'email. Default vuota. |
-| `--phone NUMBER` | Numero di telefono reale. Nessuna attività supportata invia ancora messaggi a un telefono, quindi oggi non viene usato. Default vuoto. |
+| `--phone NUMBER` | Numero di telefono reale. Lo riceve un contatto per ogni caso il cui percorso invia un SMS, così il tester può controllarlo. Default vuoto: l'SMS non si può verificare. |
 | `--contacts N` | Contatti per caso. Default 3. |
 | `--random-contacts N` | Contatti nel caso statistico di un random split. Default 50. |
 | `--case-insensitive` | I confronti di testo ignorano maiuscole e minuscole, quindi `Email` corrisponde a `EMAIL`. Default disattivata. |
@@ -43,10 +43,10 @@ Il comando termina con codice 0 quando tutti i trust check sono superati e con c
 
 | File | Contenuto |
 | --- | --- |
-| `<TableName>.csv` | Un file per ogni tabella letta dal journey o dalla entry query, con tutti gli scenari insieme, pronto da importare. UTF-8, separato da virgole, con i nomi esatti dei campi dello schema come intestazione, `True` e `False` per i Boolean e una cella vuota per il null. |
+| `<TableName>.csv` | Un file per ogni tabella letta dal journey o dalla entry query, comprese le tabelle di collegamento attraverso cui il journey raggiunge una tabella, con tutti gli scenari insieme, pronto da importare. UTF-8, separato da virgole, con i nomi esatti dei campi dello schema come intestazione, `True` e `False` per i Boolean e una cella vuota per il null. Il CSV di una data extension sincronizzata dal CRM (managed) si importa come gli altri; il report dice solo che la tabella è sincronizzata e che le sue righe arriveranno anche dalla sincronizzazione. |
 | `scenarios.csv` | Una riga per scenario: la chiave, l'ordine di esecuzione, quale scenario è attivo all'inizio, i casi e i contatti, e i valori a livello di scenario. |
-| `report.md` | Da leggere per primo. Riepilogo, trust check, tabelle, come eseguire i test, scenari e casi, branch non coperti e perché, elementi non supportati, warning e pattern sospetti, assunzioni, impostazioni usate. Si apre con un avviso quando elementi non supportati lasciano branch non coperti. |
-| `testbook.xlsx` | Un test per caso nel formato del team: ID, Owner system, Test name, Description, Pre conditions, Detailed steps, Expected result, Status, Note. I passi danno anche la durata minima di ogni test. |
+| `report.md` | Da leggere per primo. Riepilogo, trust check, tabelle, come eseguire i test, scenari e casi, branch non coperti e perché, criteri di uscita (sezione "Criteri di uscita"), elementi non supportati, warning e pattern sospetti, assunzioni, impostazioni usate. Si apre con un avviso quando elementi non supportati lasciano branch non coperti e, quando i dati dipendono dalla data di oggi, con la scadenza di attivazione: l'ora entro cui importare i file e attivare il journey. |
+| `testbook.xlsx` | Un test per caso nel formato del team: ID, Owner system, Test name, Description, Pre conditions, Detailed steps, Expected result, Status, Note. I passi danno anche la durata minima di ogni test e la timeline del caso (il giorno e l'ora di ogni passo, contati dall'ora di ingresso), e le note riportano la scadenza di attivazione dei suoi dati. |
 | `test_data.zip` | Tutti i file precedenti in un solo archivio. |
 
 Termini usati in questi file:
@@ -59,7 +59,7 @@ Termini usati in questi file:
 ## Come un tester usa i file
 
 1. Apri `report.md`. Verifica che tutti i trust check siano superati, poi leggi la sezione "Come eseguire i test", che segue la entry source del journey (vedi "La procedura di ingresso" qui sotto).
-2. Popola la tabella di ingresso a mano, con l'import diretto dei CSV: importa prima i CSV delle tabelle collegate e per ultimo il CSV di ingresso. Durante il test non si esegue nessuna automation.
+2. Popola la tabella di ingresso a mano, con l'import diretto dei CSV: importa prima i CSV delle tabelle collegate e per ultimo il CSV di ingresso. Durante il test non si esegue nessuna automation. Importa anche il CSV di una data extension sincronizzata dal CRM, come gli altri: il report ricorda che le sue righe arriveranno anche dalla sincronizzazione. Se il report indica una scadenza di attivazione, importa i file e attiva il journey entro quell'ora, altrimenti i valori che dipendono dalla data di oggi cambiano percorso.
 3. Quando il report lo indica, esegui uno scenario alla volta, in ordine di esecuzione. I CSV partono con il primo scenario attivo. Per rendere attivo uno scenario, imposta il campo di attivazione a True sulla riga dello scenario e a False su tutte le altre righe. Il report indica il campo: nel pilot è `ACTIVE` di `DE_NCRM_AD_HOC_CONFIG`. Il campo di attivazione è un filtro della entry query e nessuno split lo legge, quindi con l'import diretto non trattiene alcuno scenario.
 4. Prima di passare allo scenario successivo, aspetta che i contatti dello scenario corrente siano usciti dal journey. Non cambiare altro e non reimportare nulla, perché il journey legge i dati degli split nel momento in cui un contatto raggiunge lo split.
 5. Segui il testbook, una riga per caso. I passi indicano le attese, le eventuali azioni manuali con la loro scadenza e le evidenze da raccogliere. Confronta quello che vedi con l'Expected result.
@@ -78,7 +78,7 @@ La procedura dipende dalla entry source del journey, letta dall'export. Il repor
 | Data extension con pianificazione ricorrente | Procedura da verificare: i contatti dovrebbero entrare alla valutazione successiva della data extension. |
 | Form CloudPages, API event o altro | I contatti non entrano con l'import di un CSV. Il test si fa su una copia del journey la cui entry source è una data extension con le stesse colonne, e il CSV di ingresso va in quella data extension. |
 
-Con le modalità di ingresso `OnceAndDone` e `SingleEntryAcrossAllVersions` ogni tentativo richiede un nuovo run identifier. Filtri di ingresso, goal ed exit criteria non sono modellati: il report li segnala, perché alcuni contatti potrebbero non entrare o uscire prima.
+Con le modalità di ingresso `OnceAndDone` e `SingleEntryAcrossAllVersions` ogni tentativo richiede un nuovo run identifier. Filtri di ingresso e goal non sono modellati: il report li segnala, perché alcuni contatti potrebbero non entrare o uscire prima. Gli exit criteria che il generatore sa valutare sono modellati: alla fine di ogni wait, se sono veri, il contatto esce dal journey (sezione "Criteri di uscita" di `report.md`); gli altri sono segnalati come non modellati.
 
 Quando uno split controlla se il contatto ha una riga in una tabella collegata (per esempio se ha compilato un form), alcuni casi hanno la riga assente: i loro contatti non hanno righe nel CSV di quella tabella, e il testbook lo dice nelle Pre conditions. È voluto.
 
@@ -125,6 +125,8 @@ Queste sono le impostazioni della spec. La riga di comando usa i default e le op
 | Numero di telefono reale | Vuoto | `--phone` |
 | Numero di telefono fittizio | `333333333333` | nessuna |
 | Durata della finestra di validità | Da ieri a 7 giorni dopo | nessuna |
+| Ora di ingresso (da cui parte l'orologio dei wait e delle date relative a oggi) | L'ora di generazione | nessuna: la riga di comando usa sempre l'ora di generazione |
+| Validità minima dei dati (giorni) | 1 | nessuna |
 | Offset della data di wait | 0 ore | nessuna |
 | Offset della data di wait prima di un engagement split | 24 ore | nessuna |
 | Formato delle date nei CSV | `YYYY-MM-DD HH:MM` | nessuna |
@@ -153,11 +155,12 @@ Ogni valore viene dalla prima di queste regole che si applica:
 
 Supportato nel PoC:
 
-- Attività: decision split, engagement split, random split, wait by duration, wait by attribute, send-time wait, email, update contact.
-- Operatori nelle condizioni: `Is`, `Equal` e `IsNull`, più `NotEqual`, `IsNotNull`, `GreaterThan`, `GreaterThanOrEqual`, `LessThan`, `LessThanOrEqual`, `Contains`, `BeginsWith` e `EndsWith`, ripresi dallo strumento precedente, e `Between` con il valore `basso|alto`, estremi compresi.
-- Sorgenti dei dati: Contact Data (`<attribute set>.<campo>`, letti quando il contatto arriva allo split) e Journey Data (`Event.<chiave>.<campo>`, la riga di ingresso com'era all'ingresso). Un confronto tra due attributi è supportato solo nella forma "campo collegato alla chiave del contatto uguale alla chiave del contatto", letta come "il contatto ha una riga in quella tabella"; le altre forme sono segnalate come non supportate.
+- Attività: decision split, engagement split, random split, wait by duration, wait by attribute (anche con offset rispetto alla data del campo, per esempio "13 days before"), send-time wait, email, SMS, update contact.
+- Operatori nelle condizioni: `Is`, `Equal` e `IsNull`, più `NotEqual`, `IsNotNull`, `GreaterThan`, `GreaterThanOrEqual`, `LessThan`, `LessThanOrEqual`, `Contains`, `BeginsWith` e `EndsWith`, ripresi dallo strumento precedente, e `Between` con il valore `basso|alto`, estremi compresi. Per le date: `After`, `AtOrAfter`, `Before` e `AtOrBefore`, anche con una data relativa a oggi ("Today", "Today Plus 90 days", "Today Minus 7 days"), e `IsNot`.
+- Sorgenti dei dati: Contact Data (`<attribute set>.<campo>`, letti quando il contatto arriva allo split) e Journey Data (`Event.<chiave>.<campo>`, la riga di ingresso com'era all'ingresso). Un confronto tra due attributi è supportato solo nella forma "campo collegato alla chiave del contatto uguale alla chiave del contatto", letta come "il contatto ha una riga in quella tabella"; le altre forme sono segnalate come non supportate. Una tabella raggiunta attraverso un'altra tabella (per esempio una tabella di festività collegata al contatto da una tabella di collegamento) riceve anche il CSV della tabella di collegamento.
+- Exit criteria: valutati alla fine di ogni wait con gli stessi operatori, sorgenti e date relative degli split. Un contatto che li soddisfa esce dal journey in quel punto.
 - Entry source: data extension alimentata da un'automation, data extension "Run Once" o con pianificazione ricorrente, form CloudPages e API event, ciascuna con la sua procedura (vedi "La procedura di ingresso").
-- SQL nelle entry query: nomi di tabella, uguaglianze di join, filtri WHERE semplici su uguaglianza, null e intervalli di date, ed espressioni semplici nella select. Un filtro o un'espressione più complessi vengono segnalati, e una colonna di ingresso che ne dipende riceve un segnaposto.
+- SQL nelle entry query: nomi di tabella, uguaglianze di join, filtri WHERE semplici su uguaglianza, null e intervalli di date, ed espressioni semplici nella select, tra cui il confronto della data di una colonna con la data corrente spostata di alcuni giorni. Una colonna della select copiata da un'altra tabella ha lo stesso valore della sorgente. Una colonna che la query calcola con un'espressione che il generatore non capisce (per esempio un `CASE`) riceve il valore che serve al caso, valido solo con l'import diretto dei CSV. Un `LEFT JOIN` è letto come un join interno. Un filtro o un'espressione più complessi vengono segnalati, e una colonna di ingresso che ne dipende riceve un segnaposto.
 
 ## Assunzioni da verificare
 
@@ -184,5 +187,6 @@ L'interfaccia, i messaggi del generatore (warning, trust check, errori di lettur
 | `tests/` | Test unitari per modulo, gli esempi e il test end-to-end sul pilot |
 | `examples/` | Piccoli journey costruiti a mano con le risposte attese |
 | `fixtures/` | L'export del pilot |
+| `tools/` | Script di diagnosi per gli export dei clienti, che restano fuori dalla repository: `dump_cj.py` (dump strutturale di un export), `graph_cj.py` (grafo compatto del journey e inventario dei costrutti), `run_cohort.py` (esegue il generatore su un gruppo di export e confronta con le risposte derivate a mano). Non fanno parte del generatore. |
 
 Esegui i test con `python -m pytest`. I test sul pilot impiegano circa un minuto.

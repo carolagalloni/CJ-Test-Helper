@@ -793,9 +793,9 @@ def build_unsupported_element() -> dict:
     m = "DE_Master"
     j = Journey(pkg, "EX_UnsupportedElement")
     j.decision("SPLIT-1", "Mail offers", [
-        ("path_a", "true", criteria(pkg.cond(m, "IsMailOffers", "Is", "true")), "SMSSYNC-1", "IsMailOffers is True"),
+        ("path_a", "true", criteria(pkg.cond(m, "IsMailOffers", "Is", "true")), "PUSH-1", "IsMailOffers is True"),
         ("remainder_path", "false", None, "UPDATE-1", None)])
-    j.other("SMSSYNC-1", "SMSSYNC", "Send SMS", "SPLIT-2")
+    j.other("PUSH-1", "PUSHNOTIFICATIONACTIVITY", "Send push notification", "SPLIT-2")
     j.decision("SPLIT-2", "Phone consent", [
         ("path_a", "true", criteria(pkg.cond(m, "PhoneConsent", "Is", "true")), "UPDATE-2", "PhoneConsent is True"),
         ("remainder_path", "false", None, "UPDATE-3", None)])

@@ -39,6 +39,7 @@ from cjhelper.model import (  # noqa: E402
     LEVEL_CONTACT,
     LEVEL_SCENARIO,
     ROLE_ENTRY,
+    ROLE_LINK,
     ROLE_SOURCE,
     ROLE_SPLIT,
     ROLE_WRITTEN,
@@ -46,21 +47,27 @@ from cjhelper.model import (  # noqa: E402
     Activity,
     ColumnRef,
     Condition,
+    ConditionGroup,
+    DateOffsetFilter,
     EntryEvent,
     EqualityFilter,
     Field,
     JoinEquality,
     Journey,
+    JourneyFilter,
     Outcome,
     Package,
     ParsedQuery,
     Query,
     Relationship,
     SelectColumn,
+    SelectConcat,
     SelectItem,
+    SelectLiteral,
     Table,
     TableRef,
     Write,
+    formula_conditions,
 )
 
 PILOT = Path(__file__).resolve().parent.parent / "fixtures" / "CJ template complesso-v1.json"
@@ -88,14 +95,15 @@ def date(name):
     return Field(name=name, type="Date", length=None, is_primary_key=False, is_nullable=True, default=None, ordinal=0)
 
 
-def make_table(name, *fields, sendable_field=None):
+def make_table(name, *fields, sendable_field=None, managed=False):
     numbered = [replace(f, ordinal=i) for i, f in enumerate(fields)]
     return Table(id=f"id-{name}", name=name, customer_key=name, fields=numbered,
-                 is_sendable=sendable_field is not None, sendable_field=sendable_field)
+                 is_sendable=sendable_field is not None, sendable_field=sendable_field, managed=managed)
 
 
-def cond(table, field, value="true", operator="Is"):
-    return Condition(table=table, field=field, operator=operator, value=value)
+def cond(table, field, value="true", operator="Is", path=()):
+    """A Contact Data condition; ``path`` = the tables between the contact and ``table`` (as loader.py fills it)."""
+    return Condition(table=table, field=field, operator=operator, value=value, path=tuple(path))
 
 
 def decision(key, *conditions):
@@ -106,9 +114,10 @@ def decision(key, *conditions):
     return Activity(key=key, raw_type="MULTICRITERIADECISION", kind=KIND_DECISION, name=key, outcomes=outcomes)
 
 
-def wait_on(key, table, field):
+def wait_on(key, table, field, path=()):
     return Activity(key=key, raw_type="WAIT", kind=KIND_WAIT_ATTRIBUTE, name=key,
-                    outcomes=[Outcome(key=f"{key}-out", label="", next=None)], wait_field=(table, field))
+                    outcomes=[Outcome(key=f"{key}-out", label="", next=None)], wait_field=(table, field),
+                    wait_path=tuple(path))
 
 
 def update(key, table, field, value="x"):
@@ -147,12 +156,12 @@ def col(ref):
     return ColumnRef(table=table, column=column)
 
 
-def parsed(name, target, sources, joins=(), filters=(), select=(), warnings=()):
+def parsed(name, target, sources, joins=(), filters=(), select=(), warnings=(), optional=()):
     """A ParsedQuery: joins are (left, right) pairs, filters (column, value) equalities,
-    select (target column, source column) plain copies."""
+    select (target column, source column) plain copies; the ``optional`` sources are LEFT JOINed."""
     return ParsedQuery(
         name=name, target_table=target,
-        sources=[TableRef(table=t, alias=None) for t in sources],
+        sources=[TableRef(table=t, alias=None, optional=t in optional) for t in sources],
         joins=[JoinEquality(left=col(a), right=col(b)) for a, b in joins],
         filters=[EqualityFilter(column=col(c), value=v) for c, v in filters],
         select=[SelectItem(target_column=t, expr=SelectColumn(source=col(s))) for t, s in select],
@@ -944,6 +953,367 @@ def test_journey_data_reads_the_entry_table(sql):
 
 
 # ---------------------------------------------------------------------------
+# Step 3: link tables, inferred paths, aliases, LEFT JOIN and managed sources
+# ---------------------------------------------------------------------------
+
+HL_ENTRY = "DE_HL_Entry"
+HOLIDAY_ENTRY = "Holiday_Entry"
+HOLIDAY = "Holiday_DE"
+
+
+def holiday_package(with_paths=True):
+    """The shape of the step 3 exports (examples/link_table_path): a Run Once entry sendable on SubscriberKey,
+    Holiday_Entry linked to the contact by a group-to-set relationship on SubscriberKey, Holiday_DE linked to
+    Holiday_Entry on HKey. A split reads Holiday_DE.HStart and a wait by attribute Holiday_DE.HEnd, both through
+    Holiday_Entry (as loader.py fills ``Condition.path`` and ``Activity.wait_path``); a Master table linked to
+    the contact on SubscriberKey is read by another split."""
+    path = (HOLIDAY_ENTRY,) if with_paths else ()
+    table_list = [
+        make_table(HL_ENTRY, text("SubscriberKey", pk=True), text("EmailAddress"), sendable_field="SubscriberKey"),
+        make_table(HOLIDAY_ENTRY, text("SubscriberKey", pk=True), text("HKey")),
+        make_table(HOLIDAY, text("HKey"), date("HStart"), date("HEnd")),
+        make_table(MASTER, text("SubscriberKey", pk=True), boolean("Optin")),
+    ]
+    activities = [
+        decision("SPLIT-1", cond(HOLIDAY, "HStart", ";+;0;days", "After", path),
+                 cond(HOLIDAY, "HStart", ";+;0;days", "AtOrBefore", path)),
+        wait_on("WAIT-1", HOLIDAY, "HEnd", path),
+        decision("SPLIT-2", cond(MASTER, "Optin")),
+    ]
+    relationships = [relation(None, None, HOLIDAY_ENTRY, "SubscriberKey"),
+                     relation(HOLIDAY_ENTRY, "HKey", HOLIDAY, "HKey"),
+                     relation(None, None, MASTER, "SubscriberKey")]
+    package = make_package(table_list, activities, entry=HL_ENTRY, relationships=relationships)
+    package.entry_event = EntryEvent(key="EV", name="EV", table=HL_ENTRY, automation_name=None, kind=ENTRY_RUN_ONCE)
+    return package
+
+
+def test_link_table_on_the_path_of_a_split_and_a_wait(sql):
+    """Spec, step 3, "Tables reached through other tables": "Every table on the path from the contact to a read
+    table is a link table: it gets a CSV, with the role 'link' ... the link table joined on the contact key is
+    contact-level, the table it points to through another field is scenario-level ..., and the scenario key is
+    written into the linking field of the link table." """
+    model = tables.build_table_model(holiday_package())
+
+    assert summary(model) == {
+        HL_ENTRY: ({ROLE_ENTRY}, True, LEVEL_CONTACT),
+        MASTER: ({ROLE_SPLIT}, True, LEVEL_CONTACT),
+        HOLIDAY: ({ROLE_SPLIT}, True, LEVEL_SCENARIO),
+        HOLIDAY_ENTRY: ({ROLE_LINK}, True, LEVEL_CONTACT),
+    }
+    assert model.contact_tables == [HL_ENTRY, MASTER, HOLIDAY_ENTRY]
+    assert model.scenario_tables == [HOLIDAY]
+    assert groups(model) == [
+        ("contact", [(HL_ENTRY, "SubscriberKey"), (MASTER, "SubscriberKey"), (HOLIDAY_ENTRY, "SubscriberKey")]),
+        ("scenario", [(HOLIDAY, "HKey"), (HOLIDAY_ENTRY, "HKey")]),
+    ]
+    assert model.field_levels[(HOLIDAY_ENTRY, "HKey")] == LEVEL_SCENARIO
+    assert model.field_levels[(HOLIDAY_ENTRY, "SubscriberKey")] == LEVEL_CONTACT
+    assert {model.field_levels[(HOLIDAY, f)] for f in ("HKey", "HStart", "HEnd")} == {LEVEL_SCENARIO}
+    assert model.tables[HOLIDAY_ENTRY].reason == (
+        "Sul percorso tra il contatto e Holiday_DE letta da SPLIT-1 e WAIT-1: senza le sue righe il journey non può "
+        "leggere Holiday_DE. A livello di contatto: collegata alla tabella di ingresso tramite la chiave del contatto "
+        "(Holiday_Entry.SubscriberKey).")
+    assert model.tables[HOLIDAY].reason.startswith("Letta da 1 split e da 1 Wait by attribute. A livello di scenario: "
+                                                   "collegata tramite Holiday_Entry.HKey = Holiday_DE.HKey")
+    assert model.existence_tested == {}
+    assert model.aliases == []
+    assert model.warnings == []
+
+
+def test_a_path_given_by_the_wait_alone_is_enough(sql):
+    """The split names no path, the wait does: Holiday_Entry is a link table from the wait's path, and the
+    split's table is reached through it, so nothing has to be inferred."""
+    package = holiday_package(with_paths=False)
+    package.journey.activities["WAIT-1"].wait_path = (HOLIDAY_ENTRY,)
+    model = tables.build_table_model(package)
+    assert model.tables[HOLIDAY_ENTRY].roles == {ROLE_LINK}
+    assert model.tables[HOLIDAY_ENTRY].reason.startswith(
+        "Sul percorso tra il contatto e Holiday_DE letta da WAIT-1: senza le sue righe")
+    assert model.tables[HOLIDAY].level == LEVEL_SCENARIO
+    assert model.warnings == []
+
+
+def test_link_table_that_is_also_read_keeps_its_roles(sql):
+    """The pilot's Config is read through Master and the entry table (``path`` as loader.py fills it from the
+    pilot export): both keep their roles; their reason says they are on the path too."""
+    package = pilot_like(sql)
+    path = (MASTER, ENTRY)
+    package.journey.activities["SPLIT-1"] = decision("SPLIT-1", cond(CONFIG, "CHANNEL1", "Email", "Equal", path))
+    package.journey.activities["WAIT-1"] = wait_on("WAIT-1", CONFIG, "WAIT1", path)
+    before = tables.build_table_model(pilot_like(sql))
+    model = tables.build_table_model(package)
+
+    assert summary(model) == summary(before)
+    assert groups(model) == groups(before)
+    assert model.field_levels == before.field_levels
+    assert model.warnings == []
+    link = ("È anche sul percorso tra il contatto e DE_Config letta da SPLIT-1 e WAIT-1: senza le sue righe il "
+            "journey non può leggere DE_Config.")
+    assert model.tables[MASTER].reason == (
+        f"Letta da 1 split e dalla entry query Q_Entry. {link} A livello di contatto: collegata alla tabella di "
+        "ingresso tramite la chiave del contatto (DE_Master.ContactId).")
+    assert model.tables[ENTRY].reason == (
+        "Tabella di ingresso del journey, popolata dalla entry query Q_Entry; scritta anche da 1 attività Update "
+        f"contact. {link} A livello di contatto: è la tabella di ingresso, una riga per contatto.")
+    assert model.tables[CONFIG].reason == before.tables[CONFIG].reason
+
+
+def test_written_link_table_and_unknown_path_table(sql):
+    package = holiday_package()
+    package.journey.activities["UPDATE-1"] = update("UPDATE-1", HOLIDAY_ENTRY, "HKey", "B")
+    package.journey.activities["SPLIT-3"] = decision("SPLIT-3", cond(HOLIDAY, "HStart", None, "IsNull",
+                                                                      ("DE_Ghost_Link", HOLIDAY_ENTRY)))
+    model = tables.build_table_model(package)
+
+    assert model.tables[HOLIDAY_ENTRY].roles == {ROLE_LINK}
+    assert model.tables[HOLIDAY_ENTRY].reason.startswith(
+        "Sul percorso tra il contatto e Holiday_DE letta da SPLIT-1, WAIT-1 e SPLIT-3: senza le sue righe il journey "
+        "non può leggere Holiday_DE; scritta anche da 1 attività Update contact. A livello di contatto:")
+    assert model.warnings == [
+        "La tabella DE_Ghost_Link, sul percorso tra il contatto e Holiday_DE letta da SPLIT-3, non è nell'export: non "
+        "è possibile crearne il CSV"]
+
+
+def test_journey_data_names_no_path(sql):
+    """Journey Data reads the entry row: a path on such a condition (loader.py leaves it empty) is not followed."""
+    package = holiday_package()
+    package.journey.activities["SPLIT-4"] = decision("SPLIT-4", Condition(
+        table=HL_ENTRY, field="EmailAddress", operator="IsNull", value=None, source=SOURCE_JOURNEY,
+        path=(MASTER,)))
+    model = tables.build_table_model(package)
+    assert model.tables[MASTER].roles == {ROLE_SPLIT}
+    assert "percorso" not in model.tables[MASTER].reason
+
+
+def test_inferred_chain_when_the_export_gives_no_path(sql):
+    """Spec, step 3: "When the export gives no path for a read table that no selected table joins, the generator
+    looks for the shortest chain of relationships from the contact to it and uses it with a warning"."""
+    model = tables.build_table_model(holiday_package(with_paths=False))
+
+    assert summary(model) == {
+        HL_ENTRY: ({ROLE_ENTRY}, True, LEVEL_CONTACT),
+        MASTER: ({ROLE_SPLIT}, True, LEVEL_CONTACT),
+        HOLIDAY: ({ROLE_SPLIT}, True, LEVEL_SCENARIO),
+        HOLIDAY_ENTRY: ({ROLE_LINK}, True, LEVEL_CONTACT),
+    }
+    assert groups(model) == [
+        ("contact", [(HL_ENTRY, "SubscriberKey"), (MASTER, "SubscriberKey"), (HOLIDAY_ENTRY, "SubscriberKey")]),
+        ("scenario", [(HOLIDAY, "HKey"), (HOLIDAY_ENTRY, "HKey")]),
+    ]
+    assert model.warnings == [
+        "La tabella Holiday_DE è raggiunta dal contatto attraverso Holiday_Entry (percorso dedotto dalle relazioni "
+        "dell'export, non indicato dallo split)"]
+    assert model.tables[HOLIDAY_ENTRY].reason.startswith(
+        "Sul percorso tra il contatto e Holiday_DE letta da SPLIT-1 e WAIT-1 (percorso dedotto dalle relazioni "
+        "dell'export, non indicato dallo split): senza le sue righe il journey non può leggere Holiday_DE.")
+    assert "non collegata alla tabella di ingresso" not in model.tables[HOLIDAY].reason
+
+
+def test_inferred_chain_is_the_shortest_and_follows_relationships_both_ways(sql):
+    """Entry <- DE_L1 (ContactId) <- DE_L2 (Region) -> DE_X (Zone): the relationships point both ways along the
+    chain. A longer chain DE_L1 -> DE_A -> DE_B -> DE_X is not taken. DE_L1 holds the contact key but has no CSV:
+    it is on the path too."""
+    package = make_package(
+        [make_table(ENTRY, text("ContactId", pk=True), sendable_field="ContactId"),
+         make_table("DE_L1", text("ContactId", pk=True), text("Region"), text("Other")),
+         make_table("DE_L2", text("Region", pk=True), text("Zone")),
+         make_table("DE_A", text("Other", pk=True), text("Code")),
+         make_table("DE_B", text("Code", pk=True), text("Zone")),
+         make_table("DE_X", text("Zone", pk=True), boolean("Flag"))],
+        [decision("SPLIT-1", cond("DE_X", "Flag"))],
+        relationships=[relation("DE_L1", "ContactId", ENTRY, "ContactId"),
+                       relation("DE_L1", "Other", "DE_A", "Other"),
+                       relation("DE_A", "Code", "DE_B", "Code"),
+                       relation("DE_B", "Zone", "DE_X", "Zone"),
+                       relation("DE_L2", "Region", "DE_L1", "Region"),
+                       relation("DE_L2", "Zone", "DE_X", "Zone")])
+    model = tables.build_table_model(package)
+
+    assert model.warnings == [
+        "Nessuna query dell'automation di ingresso A_Entry popola la tabella di ingresso DE_Entry, e nessun'altra "
+        "query dell'export popola DE_Entry: non c'è una entry query, quindi l'unica sorgente è la tabella di "
+        "ingresso",
+        "La tabella DE_X è raggiunta dal contatto attraverso DE_L1 e DE_L2 (percorso dedotto dalle relazioni "
+        "dell'export, non indicato dallo split)",
+    ]
+    assert summary(model) == {
+        ENTRY: ({ROLE_ENTRY}, True, LEVEL_CONTACT),
+        "DE_A": (set(), False, None),
+        "DE_B": (set(), False, None),
+        "DE_L1": ({ROLE_LINK}, True, LEVEL_CONTACT),
+        "DE_L2": ({ROLE_LINK}, True, LEVEL_SCENARIO),
+        "DE_X": ({ROLE_SPLIT}, True, LEVEL_SCENARIO),
+    }
+    assert model.tables["DE_L2"].reason.startswith("Sul percorso tra il contatto e DE_X letta da SPLIT-1 (percorso "
+                                                   "dedotto")
+    assert model.field_levels[("DE_L1", "Region")] == LEVEL_SCENARIO
+    assert model.field_levels[("DE_L1", "Other")] == LEVEL_CONTACT
+
+
+def test_no_chain_keeps_the_earlier_rule(sql):
+    """Spec, step 3: "with no chain at all, the earlier rule applies (one row shared by all contacts,
+    assumption)". DE_Island is linked to a table no chain from the contact reaches."""
+    package = holiday_package(with_paths=False)
+    package.relationships = [relation(None, None, MASTER, "SubscriberKey")]
+    package.tables["DE_Island"] = make_table("DE_Island", text("Code", pk=True))
+    package.relationships.append(relation("DE_Island", "Code", HOLIDAY, "HKey"))
+    model = tables.build_table_model(package)
+
+    assert summary(model)[HOLIDAY_ENTRY] == (set(), False, None)
+    assert summary(model)["DE_Island"] == (set(), False, None)
+    assert model.tables[HOLIDAY].level == LEVEL_SCENARIO
+    assert "non collegata alla tabella di ingresso" in model.tables[HOLIDAY].reason
+    assert model.warnings == [
+        "La tabella Holiday_DE non è collegata alla tabella di ingresso: è trattata come una riga condivisa da tutti "
+        "i contatti (a livello di scenario). È un'assunzione: verifica come il journey collega questa tabella"]
+
+
+def test_many_readers_are_counted_by_kind(sql):
+    """Up to five readers are named by key; above five the link reason counts them by kind."""
+    package = holiday_package()
+    for n in range(2, 5):
+        package.journey.activities[f"SPLIT-H{n}"] = decision(
+            f"SPLIT-H{n}", cond(HOLIDAY, "HStart", None, "IsNull", (HOLIDAY_ENTRY,)))
+    model = tables.build_table_model(package)
+    assert model.tables[HOLIDAY_ENTRY].reason.startswith(
+        "Sul percorso tra il contatto e Holiday_DE letta da SPLIT-1, WAIT-1, SPLIT-H2, SPLIT-H3 e SPLIT-H4: senza")
+
+    package.journey.activities["WAIT-2"] = wait_on("WAIT-2", HOLIDAY, "HStart", (HOLIDAY_ENTRY,))
+    model = tables.build_table_model(package)
+    assert model.tables[HOLIDAY_ENTRY].reason.startswith(
+        "Sul percorso tra il contatto e Holiday_DE letta da 4 split e 2 Wait by attribute: senza le sue righe il "
+        "journey non può leggere Holiday_DE.")
+
+
+def exit_criterion(formula, key="EXITCRITERIA", unsupported_reason=None):
+    return JourneyFilter(key=key, name="Exit", kind="exit", formula=formula, unsupported_reason=unsupported_reason)
+
+
+def test_table_read_only_by_an_exit_criterion_gets_a_csv(sql):
+    """Team decision on spec step 3, "Exit criteria and goals": the tables an evaluable exit criterion reads
+    count as split tables, so they get a CSV; the table on their path is a link table."""
+    package = holiday_package()
+    package.tables["DE_Contract"] = make_table("DE_Contract", text("SubscriberKey", pk=True), date("CancelDate"))
+    package.relationships.append(relation(None, None, "DE_Contract", "SubscriberKey"))
+    package.tables["DE_Promo"] = make_table("DE_Promo", text("HKey", pk=True), boolean("Active"))
+    package.relationships.append(relation(HOLIDAY_ENTRY, "HKey", "DE_Promo", "HKey"))
+    package.journey.exits = [exit_criterion(ConditionGroup(operator="OR", items=(
+        cond("DE_Contract", "CancelDate", None, "IsNotNull"),
+        cond("DE_Promo", "Active", "true", "Is", (HOLIDAY_ENTRY,)),
+        cond(MASTER, "Optin", "false"))))]
+    model = tables.build_table_model(package)
+
+    contract, promo = model.tables["DE_Contract"], model.tables["DE_Promo"]
+    assert (contract.roles, contract.selected, contract.level) == ({ROLE_SPLIT}, True, LEVEL_CONTACT)
+    assert contract.reason == ("Letta dai criteri di uscita (exit criteria). A livello di contatto: collegata alla "
+                               "tabella di ingresso tramite la chiave del contatto (DE_Contract.SubscriberKey).")
+    assert (promo.roles, promo.selected, promo.level) == ({ROLE_SPLIT}, True, LEVEL_SCENARIO)
+    assert model.tables[MASTER].reason.startswith("Letta da 1 split e dai criteri di uscita (exit criteria).")
+    assert model.tables[HOLIDAY_ENTRY].reason.startswith(
+        "Sul percorso tra il contatto e Holiday_DE letta da SPLIT-1 e WAIT-1, e tra il contatto e DE_Promo letta da "
+        "EXITCRITERIA: senza le sue righe il journey non può leggere Holiday_DE e DE_Promo.")
+    assert model.warnings == []
+
+
+def test_exit_criteria_not_evaluated_read_nothing(sql):
+    """An exit criterion the generator cannot evaluate is reported as not modelled (loader.py): it reads no table.
+    A Journey Data condition of an exit criterion reads the entry table, as a split's does."""
+    package = holiday_package()
+    package.tables["DE_Contract"] = make_table("DE_Contract", text("SubscriberKey", pk=True), date("CancelDate"))
+    package.journey.exits = [
+        exit_criterion(cond("DE_Contract", "CancelDate", None, "IsNotNull"), unsupported_reason="operatore"),
+        exit_criterion(Condition(table=HL_ENTRY, field="EmailAddress", operator="IsNull", value=None,
+                                 source=SOURCE_JOURNEY), key="EXIT-2"),
+    ]
+    model = tables.build_table_model(package)
+    assert summary(model)["DE_Contract"] == (set(), False, None)
+    assert model.tables[HL_ENTRY].roles == {ROLE_ENTRY, ROLE_SPLIT}
+    assert "letta anche dai criteri di uscita (exit criteria)" in model.tables[HL_ENTRY].reason
+
+
+def test_entry_copies_are_aliases_and_keys_are_not(sql):
+    """Spec, step 3, "Columns the entry query derives and columns it copies": a plain column copy is one variable
+    with its source. The copies of ContactId and CampaignName are keys (key groups); FirstName is not a column of
+    the entry table."""
+    model = tables.build_table_model(pilot_like(sql))
+    assert model.aliases == [[(ENTRY, "Emailaddress"), (MASTER, "Emailaddress")]]
+
+
+def test_aliases_through_a_chain_of_queries_and_only_plain_columns(sql):
+    package = make_package(
+        [make_table(ENTRY, text("ContactId", pk=True), text("Email"), text("Label"), text("Code"),
+                    sendable_field="ContactId"),
+         make_table("DE_A", text("Id", pk=True), text("Email"), text("Name")),
+         make_table("DE_B", text("Key", pk=True), text("Mail"), text("Name"))],
+        queries=[query("Q2", "DE_A"), query("Q1", ENTRY)], automation=["Q1"])
+    q1 = parsed("Q1", ENTRY, ["DE_A"], select=[("ContactId", "DE_A.Id"), ("Email", "DE_A.Email")])
+    q1.select += [SelectItem(target_column="Label", expr=SelectLiteral(value="Gold")),
+                  SelectItem(target_column="Code", expr=SelectConcat(parts=(SelectColumn(source=col("DE_A.Name")),)))]
+    sql.add(q1)
+    sql.add(parsed("Q2", "DE_A", ["DE_B"], select=[("Id", "DE_B.Key"), ("Email", "DE_B.Mail"), ("Name", "DE_B.Name")]))
+    model = tables.build_table_model(package)
+
+    assert groups(model) == [("contact", [(ENTRY, "ContactId"), ("DE_A", "Id"), ("DE_B", "Key")])]
+    assert model.aliases == [[(ENTRY, "Email"), ("DE_A", "Email"), ("DE_B", "Mail")],
+                             [("DE_A", "Name"), ("DE_B", "Name")]]
+
+
+def test_left_join_source_says_it_is_read_as_an_inner_join(sql):
+    """Spec, step 3: "A LEFT JOIN source still gets one row per contact (read as an inner join, as before); the
+    report says so." """
+    package = make_package(
+        [make_table(ENTRY, text("ContactId", pk=True), text("Score"), sendable_field="ContactId"),
+         make_table(MASTER, text("ContactId", pk=True)),
+         make_table("DE_Score", text("ContactId", pk=True), text("Score"))],
+        queries=[query("Q_Entry", ENTRY)], automation=["Q_Entry"])
+    sql.add(parsed("Q_Entry", ENTRY, [MASTER, "DE_Score"], joins=[("DE_Master.ContactId", "DE_Score.ContactId")],
+                   select=[("ContactId", "DE_Master.ContactId"), ("Score", "DE_Score.Score")], optional=["DE_Score"]))
+    model = tables.build_table_model(package)
+
+    score = model.tables["DE_Score"]
+    assert (score.roles, score.selected, score.level) == ({ROLE_SOURCE}, True, LEVEL_CONTACT)
+    assert score.reason == (
+        "Letta dalla entry query Q_Entry. A livello di contatto: collegata alla tabella di ingresso tramite la chiave "
+        "del contatto (DE_Score.ContactId). Unita con LEFT JOIN: le righe generate la trattano come inner join.")
+    assert "LEFT JOIN" not in model.tables[MASTER].reason
+    assert model.aliases == [[(ENTRY, "Score"), ("DE_Score", "Score")]]
+
+
+def test_managed_table_keeps_its_csv_and_says_it_is_synchronized_from_the_crm(sql):
+    """Spec, step 3, "Synchronized data extensions": the CSV is produced and imported like the others; the reason
+    says the table is synchronized from the CRM. A managed table the journey does not read gets no CSV and no note."""
+    package = make_package(
+        [make_table(ENTRY, text("ContactId", pk=True), sendable_field="ContactId"),
+         make_table("CampaignMember_Salesforce_3", text("Id", pk=True), text("ContactId"), text("Status"),
+                    managed=True),
+         make_table("Account_Salesforce", text("Id", pk=True), managed=True)],
+        queries=[query("Q_Entry", ENTRY)], automation=["Q_Entry"])
+    sql.add(parsed("Q_Entry", ENTRY, ["CampaignMember_Salesforce_3"], filters=[("CampaignMember_Salesforce_3.Status",
+                                                                                "Responded")],
+                   select=[("ContactId", "CampaignMember_Salesforce_3.ContactId")]))
+    model = tables.build_table_model(package)
+
+    member = model.tables["CampaignMember_Salesforce_3"]
+    assert (member.roles, member.selected, member.level) == ({ROLE_SOURCE}, True, LEVEL_CONTACT)
+    assert member.reason.endswith("Data extension sincronizzata dal CRM: il CSV si importa come gli altri e le "
+                                  "righe arriveranno anche dalla sincronizzazione.")
+    assert "non importabile" not in member.reason
+    assert model.tables["Account_Salesforce"].reason == "Né letta né scritta da questo journey."
+
+
+def test_date_offset_filter_is_not_an_activation_field(sql):
+    package = _activation_package(sql, [])
+    sql.answers["Q_Entry"].filters = [DateOffsetFilter(column=col("DE_Config.ACTIVE"), days=0),
+                                      DateOffsetFilter(column=col("DE_Config.Label"), days=-1)]
+    model = tables.build_table_model(package)
+
+    assert model.tables[CONFIG].level == LEVEL_SCENARIO
+    assert model.activation_field is None
+    assert "campo di attivazione" not in model.tables[CONFIG].reason
+
+
+# ---------------------------------------------------------------------------
 # The pilot export, end to end (needs loader.py and sqlparse_lite.py)
 # ---------------------------------------------------------------------------
 
@@ -983,3 +1353,14 @@ def test_pilot_export():
     assert not any("non è collegata alla tabella di ingresso" in w for w in model.warnings)
     # the pilot never tests whether a row exists (its IsNull conditions read IsDunning of a source table)
     assert model.existence_tested == {}
+    # Step 3: the entry query's plain copies of Master columns the entry table has, keys excluded (ContactId,
+    # CampaignName); FirstName, LastName... are not entry columns, ActionId is a CONCAT.
+    assert model.aliases == [[(entry, name), (master, name)]
+                             for name in ("Emailaddress", "AccountId", "AccountStatus", "MobilePhone")]
+    # Config is read through Master and the entry table (loader.py's paths): they keep their roles, and their
+    # reason says they are on the path; no chain is inferred.
+    if any(c.path for a in package.journey.activities.values() for o in a.outcomes
+           for c in formula_conditions(o.formula)):
+        assert "È anche sul percorso tra il contatto e DE_NCRM_AD_HOC_CONFIG" in model.tables[master].reason
+        assert "È anche sul percorso tra il contatto e DE_NCRM_AD_HOC_CONFIG" in model.tables[entry].reason
+    assert not any("percorso dedotto" in w for w in model.warnings)

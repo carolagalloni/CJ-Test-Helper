@@ -27,3 +27,12 @@ SPLIT-2 "Source"   (DE_Entry.Source)   Equal 'PARTNER' -> UPDATE-2 ; remainder -
 The spec's value rules (priority 2, "Field read by a split") do not say what to do when the field read by a
 split is an entry column computed by the entry query; the answer above follows the consistency rule of the
 Table selection section.
+
+
+## Step 3 note: the case value is named by its source column
+
+Spec, "Extensions for time-dependent journeys", "Columns the entry query derives and columns it copies": "A column of
+the entry table copied as a plain column from a source table holds the same value as its source: the two fields are
+one variable for the coverage". The variable is represented by the source column (`DE_Master.Segment`), so the case
+values of this example are keyed by it from step 3 on. The CSVs do not change: the entry copy still holds the same
+value as its source.

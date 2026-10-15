@@ -51,6 +51,10 @@ class Table:
     fields: list[Field]
     is_sendable: bool = False
     sendable_field: Optional[str] = None   # sendableCustomObjectField: the field holding the contact key
+    # Spec, step 3, "Synchronized data extensions": a managed data extension (Package Manager issue NO_DEPLOY /
+    # ManagedDataExtension, the Salesforce objects synchronized from the CRM): its CSV is imported like the others and
+    # its rows also arrive from the sync.
+    managed: bool = False
 
     def field(self, name: str) -> Optional[Field]:
         """Case-insensitive lookup, because SQL and split criteria do not always match the schema's case."""
@@ -103,6 +107,16 @@ SOURCE_JOURNEY = "journey"   # Journey Data, Event.<eventDefinitionKey>.<field>:
 
 
 @dataclass(frozen=True)
+class RelativeDate:
+    """A condition value written ``;<sign>;<n>;<unit>`` (spec, step 3, "Relative dates in conditions"): the
+    clock's date moved by ``amount`` units in the direction of ``sign``. ``unit`` is kept as written, lower
+    case (``days``, ``weeks``, ``months``, ``years``, ``hours``, ``minutes``)."""
+    sign: int                      # +1 or -1
+    amount: int
+    unit: str
+
+
+@dataclass(frozen=True)
 class Condition:
     """One atomic condition: ``table.field operator value``.
 
@@ -128,6 +142,13 @@ class Condition:
     value: Value                   # Between: "low|high" as written
     source: str = SOURCE_CONTACT
     value_attribute: Optional[str] = None
+    # Spec, step 3: a relative date value, parsed by criteria.py (``value`` keeps the text as written).
+    relative: Optional[RelativeDate] = None
+    # Spec, step 3, "Tables reached through other tables": the tables between the contact and ``table``, nearest
+    # the contact first, excluding ``table`` itself; empty when the export gives no path. As criteria.py writes it,
+    # ``path`` holds the RELATIONSHIP IDS of the condition (``groupToSetRelationshipId`` of ``UiMetaData``, then the
+    # ``RelationshipID`` of each ``<AttributePath>`` wrapper); loader.py replaces them with the table names.
+    path: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -178,6 +199,7 @@ KIND_WAIT_ATTRIBUTE = "wait_attribute"  # WAIT with uiType WAITBYATTRIBUTE
 KIND_WAIT_STO = "wait_sto"           # STOWAIT (send-time optimisation)
 KIND_EMAIL = "email"                 # EMAILV2
 KIND_UPDATE = "update"               # UPDATECONTACTDATA
+KIND_SMS = "sms"                     # SMSSYNC: a send to the journey's default mobile number (spec, step 3)
 KIND_UNSUPPORTED = "unsupported"     # anything else: reported, never guessed
 
 # The one lookup table to extend for new activity types (spec: "one lookup table each").
@@ -189,6 +211,7 @@ ACTIVITY_KINDS: dict[str, str] = {
     "STOWAIT": KIND_WAIT_STO,
     "EMAILV2": KIND_EMAIL,
     "UPDATECONTACTDATA": KIND_UPDATE,
+    "SMSSYNC": KIND_SMS,
 }
 
 
@@ -225,6 +248,17 @@ class Activity:
     wait_unit: Optional[str] = None           # wait_duration: MINUTES, HOURS, DAYS, ...; wait_sto: HOURS
     wait_field: Optional[FieldRef] = None     # wait_attribute: (table, field) holding the date
     wait_timezone: Optional[str] = None
+    # Spec, step 3, "The clock": a wait by attribute ends at the field's date plus this offset (``waitDuration``
+    # and ``waitUnit`` of the activity, the amount possibly negative: "13 days before" is -13 DAYS), at the time
+    # of day ``wait_time_of_day`` (``specifiedTime``) when it is given, else at the time held in the field.
+    wait_offset_amount: Optional[int] = None
+    wait_offset_unit: Optional[str] = None
+    wait_time_of_day: Optional[str] = None    # "HH:MM" as written, None or "" when not given
+    # Spec, step 3, "Tables reached through other tables": the attribute sets between the contact and the
+    # wait's table, as in Condition.path (from the segments of ``waitEndDateAttributeExpression``).
+    wait_path: tuple[str, ...] = ()
+    sms_asset_id: Optional[str] = None        # sms: configurationArguments.assetId as written
+    sms_name: Optional[str] = None            # sms: the activity name
     email_asset_id: Optional[str] = None      # email
     email_name: Optional[str] = None          # email: asset name, or activity name as fallback
     engagement_kind: Optional[str] = None     # engagement: "open" or "click"
@@ -240,6 +274,19 @@ class Activity:
 
 
 @dataclass
+class JourneyFilter:
+    """An exit criterion (or a goal) of the journey (spec, step 3, "Exit criteria and goals"): its formula, mapped
+    like a decision split's, or None with ``unsupported_reason`` when the generator cannot evaluate it. Exit
+    criteria are evaluated at the end of every wait, with the clock (documented)."""
+    key: str                       # the export key, e.g. EXITCRITERIA
+    name: str
+    kind: str                      # "exit" or "goal"
+    formula: Optional[Formula]
+    description: str = ""          # metaData.criteriaDescription when present
+    unsupported_reason: Optional[str] = None
+
+
+@dataclass
 class Journey:
     name: str
     key: str
@@ -252,7 +299,11 @@ class Journey:
     activity_count: int = 0
     entry_mode: Optional[str] = None     # entryMode as written: MultipleEntries, OnceAndDone, SingleEntryAcrossAllVersions
     goal_count: int = 0                  # goals defined on the journey: not modelled, reported by loader.py
-    exit_count: int = 0                  # exit criteria defined on the journey: not modelled, reported by loader.py
+    exit_count: int = 0                  # exit criteria defined on the journey (see ``exits``)
+    # Spec, step 3: the exit criteria, parsed; graph.py evaluates the supported ones at the end of every wait.
+    exits: list[JourneyFilter] = field(default_factory=list)
+    goals: list[JourneyFilter] = field(default_factory=list)       # parsed, reported, not modelled
+    default_mobile_field: Optional[str] = None      # entry table field the journey sends SMS to (defaults.mobileNumber)
 
     def branches(self) -> list[tuple[Activity, Outcome]]:
         return [(a, o) for a in self.activities.values() for o in a.outcomes]
@@ -281,6 +332,7 @@ class ColumnRef:
 class TableRef:
     table: str
     alias: Optional[str]
+    optional: bool = False         # LEFT JOIN source: the row may be absent (read as an inner join, reported)
 
 
 @dataclass(frozen=True)
@@ -309,11 +361,19 @@ class DateBoundFilter:
 
 
 @dataclass(frozen=True)
+class DateOffsetFilter:
+    """``CAST(column AS DATE) = CAST(DATEADD(day, days, GETDATE()) AS DATE)``: the column's date part is the
+    current date moved by ``days`` (spec, step 3, "Columns the entry query derives and columns it copies")."""
+    column: ColumnRef
+    days: int
+
+
+@dataclass(frozen=True)
 class UnsupportedFilter:
     text: str
 
 
-Filter = Union[EqualityFilter, IsNullFilter, DateBoundFilter, UnsupportedFilter]
+Filter = Union[EqualityFilter, IsNullFilter, DateBoundFilter, DateOffsetFilter, UnsupportedFilter]
 
 
 @dataclass(frozen=True)
@@ -430,6 +490,10 @@ class Settings:
     case_insensitive_text: bool = False
     seed: int = 20261011
     generation_time: Optional[datetime] = None   # None = now; tests pass a fixed value
+    # Spec, step 3: the clock starts at the entry time (None = the generation time); values chosen relative to
+    # it must stay valid for at least this many days of late activation where a class of values allows it.
+    entry_time: Optional[datetime] = None
+    min_validity_days: int = 1
 
     def contact_key(self, n: int) -> str:
         return f"TST_{self.run_id}_C{n:04d}"
@@ -446,6 +510,7 @@ ROLE_ENTRY = "entry"
 ROLE_SPLIT = "split"
 ROLE_SOURCE = "source"
 ROLE_WRITTEN = "written"
+ROLE_LINK = "link"               # spec, step 3: on the path from the contact to a table a split or a wait reads
 
 LEVEL_CONTACT = "contact"
 LEVEL_SCENARIO = "scenario"
@@ -484,6 +549,11 @@ class TableModel:
     # existence a split tests (IsNull / IsNotNull on the field linked to the contact key, or the supported
     # attribute comparison): table -> that linked field. Each gets a "row present / row absent" variable.
     existence_tested: dict[str, FieldRef] = field(default_factory=dict)
+    # Spec, step 3, "Columns the entry query derives and columns it copies": groups of fields that hold the same
+    # value on every row because a followed query copies one into the other as a plain column (the entry
+    # table's copy of a source column). Key fields are in ``key_groups`` instead. The coverage treats each
+    # group as one variable; datagen writes the same value in every member.
+    aliases: list[list[FieldRef]] = field(default_factory=list)
 
     @property
     def selected_tables(self) -> list[str]:
@@ -498,6 +568,15 @@ class TableModel:
 class Step:
     activity_key: str
     outcome_key: Optional[str]       # None for the last activity when the journey exits there
+
+
+@dataclass(frozen=True)
+class TimelinePoint:
+    """The clock when a contact executes one step of its path (spec, step 3, "The clock"): one per Step, same
+    order. ``at`` is the clock as the contact reaches the activity; for a wait it is the moment the wait ends."""
+    activity_key: str
+    outcome_key: Optional[str]
+    at: datetime
 
 
 @dataclass(frozen=True)
@@ -518,6 +597,8 @@ class RandomBranch:
     end_activity_key: Optional[str]
     unknown_from: Optional[str] = None   # as Case.unknown_from, for this branch's path
     unknown_reason: str = ""
+    timeline: tuple[TimelinePoint, ...] = ()   # spec, step 3: the clock along this branch's steps
+    exit_by_criteria: Optional[str] = None     # the wait at whose end the exit criteria take the contact out
 
 
 @dataclass
@@ -589,6 +670,15 @@ class Case:
     min_duration_minutes: Optional[int] = 0
     not_before: Optional[str] = None     # the case cannot end before this date: the last wait by attribute on
                                          # its path plus the fixed waits after it (datagen); None without one
+    # Spec, step 3, "The clock": the clock at every step of the expected path (one TimelinePoint per Step).
+    timeline: list[TimelinePoint] = field(default_factory=list)
+    # Spec, step 3, "Exit criteria and goals": the wait at whose end the exit criteria take the contact out of
+    # the journey (the expected path ends there), None when the contact reaches an exit of the canvas.
+    exit_by_criteria: Optional[str] = None
+    # Spec, step 3, "Validity of the data": how many whole days the activation can slip before a value of this
+    # case's rows is read differently by a split or a wait; None when nothing in the case depends on the clock.
+    validity_days: Optional[int] = None
+    sms_sent: list[str] = field(default_factory=list)   # SMS activity keys on the path, in order
 
 
 @dataclass
@@ -644,6 +734,13 @@ class CoverageResult:
     # number or a date by order (no value inside that range is generated). Key -> why; the keys are in
     # ``unsupported`` too.
     unsupported_reasons: dict[str, str] = field(default_factory=dict)
+    # Spec, step 3, "Exit criteria and goals": one coverage target per evaluable exit criterion, "exit criteria met
+    # at the end of a wait", with activity_key = the criterion's key, outcome_key = "met", activity_kind = "exit".
+    exit_targets: list[BranchStatus] = field(default_factory=list)
+    # Spec, step 3, "Validity of the data": the earliest validity over all cases (days of late activation the data
+    # tolerates), None when nothing depends on the clock; ``perishable`` lists, in plain words, the values it comes from.
+    validity_days: Optional[int] = None
+    perishable: list[str] = field(default_factory=list)
 
     @property
     def cases(self) -> list[Case]:

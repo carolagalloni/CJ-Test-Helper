@@ -16,6 +16,6 @@
     {"contact_values": {"DE_Master.IsMailOffers": "True"}, "manual_actions": [], "contact_count": 3},
     {"end_activity": "UPDATE-1", "manual_actions": [], "contact_count": 3}
   ],
-  "unsupported": ["SMSSYNC-1"],
+  "unsupported": ["PUSH-1"],
   "checks_pass": true
 }

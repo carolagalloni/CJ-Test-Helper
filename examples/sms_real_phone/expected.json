@@ -1,0 +1,104 @@
+{
+  "journey_name": "EX_SmsRealPhone",
+  "activity_count": 4,
+  "csv_tables": [
+    "DE_Entry",
+    "DE_Master"
+  ],
+  "table_levels": {
+    "DE_Entry": "contact",
+    "DE_Master": "contact"
+  },
+  "branches": {
+    "SPLIT-1/path_a": {
+      "status": "covered"
+    },
+    "SPLIT-1/remainder_path": {
+      "status": "covered"
+    }
+  },
+  "scenario_count": {
+    "min": 1,
+    "max": 1
+  },
+  "case_count": {
+    "min": 2,
+    "max": 2
+  },
+  "contact_count": 6,
+  "cases": [
+    {
+      "contact_values": {
+        "DE_Master.SmsOptOut": "False"
+      },
+      "end_activity": "UPDATE-1",
+      "manual_actions": [],
+      "emails_sent": [],
+      "sms_sent": [
+        "SMSSYNC-1"
+      ],
+      "contact_count": 3,
+      "contact_rows": [
+        {
+          "DE_Entry.MobilePhone": "393401234567",
+          "DE_Master.Phone": "393401234567"
+        },
+        {
+          "DE_Entry.MobilePhone": "333333333333",
+          "DE_Master.Phone": "333333333333"
+        },
+        {
+          "DE_Entry.MobilePhone": "333333333333",
+          "DE_Master.Phone": "333333333333"
+        }
+      ]
+    },
+    {
+      "contact_values": {
+        "DE_Master.SmsOptOut": "True"
+      },
+      "end_activity": "UPDATE-2",
+      "manual_actions": [],
+      "emails_sent": [],
+      "sms_sent": [],
+      "contact_count": 3,
+      "contact_rows": [
+        {
+          "DE_Entry.MobilePhone": "333333333333",
+          "DE_Master.Phone": "333333333333"
+        },
+        {
+          "DE_Entry.MobilePhone": "333333333333",
+          "DE_Master.Phone": "333333333333"
+        },
+        {
+          "DE_Entry.MobilePhone": "333333333333",
+          "DE_Master.Phone": "333333333333"
+        }
+      ]
+    }
+  ],
+  "csv_values": {
+    "DE_Entry.MobilePhone": [
+      "393401234567",
+      "333333333333"
+    ],
+    "DE_Master.Phone": [
+      "393401234567",
+      "333333333333"
+    ]
+  },
+  "validity_days": null,
+  "unsupported": [],
+  "testbook_contains": [
+    [
+      "Reminder SMS",
+      "SMSSYNC-1"
+    ]
+  ],
+  "csv_no_space_cells": true,
+  "checks_pass": true,
+  "settings": {
+    "real_phone": "393401234567"
+  }
+}

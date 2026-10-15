@@ -580,7 +580,7 @@
           "criteriaDescription": "IsMailOffers is True",
           "invalid": false
          },
-         "next": "SMSSYNC-1"
+         "next": "PUSH-1"
         },
         {
          "arguments": {},
@@ -598,20 +598,20 @@
        }
       },
       {
-       "type": "SMSSYNC",
+       "type": "PUSHNOTIFICATIONACTIVITY",
        "arguments": {},
        "description": "",
-       "id": "7c7cc6ee-e5ce-51d3-be05-3b70b3275bb3",
-       "key": "SMSSYNC-1",
+       "id": "6b7328bd-c735-5a8f-b7ba-5f53dd7bacf6",
+       "key": "PUSH-1",
        "metaData": {
         "isConfigured": true
        },
        "configurationArguments": {},
-       "name": "Send SMS",
+       "name": "Send push notification",
        "outcomes": [
         {
          "arguments": {},
-         "key": "f8d7c95c-271d-505b-8465-e842cb8e044f",
+         "key": "94e16313-25ec-5d89-9d85-25d0f7ca1003",
          "metaData": {
           "invalid": false
          },

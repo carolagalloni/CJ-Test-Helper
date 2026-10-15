@@ -35,11 +35,56 @@ Spec, "Extensions beyond the pilot":
   ``Case.unknown_from``; each manual action gets its window (``Case.action_windows``) and
   each case its minimum duration, from the waits on its path.
 
+Spec, "Extensions for time-dependent journeys (step 3, 14 October 2026)":
+
+- Aliases. "A column of the entry table copied as a plain column from a source table ... holds the
+  same value as its source: the two fields are one variable for the coverage". Each group of
+  ``TableModel.aliases`` is one variable, represented by its first member outside the entry table (the
+  source column; the entry copy is derived from it), else by its first member (``alias_of``). The walker's
+  lookups read the representative for any member; fields, domains and values hold representatives only.
+- The clock. The walker starts every contact at the entry time (``Settings.entry_time``, default the
+  generation time). A Date field with a relative condition, or read by a wait by attribute with an offset,
+  gets its values from cut points and classes of candidates, each with its validity (``_clock_domain``).
+  Contact classes evaluate a predicate holding a relative condition at every fixed delay of its split.
+- Exit criteria. The fields of the evaluable exit criteria are read like those of the splits. "Every exit
+  criterion is one extra coverage target, 'exit criteria met at the end of a wait'": one bit per criterion
+  after the split branches (``exit_targets``). "A branch no contact can reach because every contact that
+  gets to the wait before it meets the exit criteria is reported as unreachable with that reason"
+  (``_exit_reason``).
+- Cases carry their timeline, their SMS sends, the wait at whose end they leave by the exit criteria, and
+  their validity ("Validity of the data"); the result gives the earliest validity and explains it.
+
+Assumptions and readings of the lead for step 3 (the spec does not fix them; each is in the developer report):
+
+- Two candidates of a clock field are one class when they decide the same way on the same paths
+  (``_behaviour``): the journey is walked with only that field known, each split with the clock of the path
+  that reaches it, both ways where a formula also depends on other fields; a wait by attribute on another field
+  counts 0, as in the fixed delays. The cut points still come from every fixed delay of each split (the clock
+  points): the entry time plus d, or the end of a wait by attribute on the field that precedes the split.
+- A wait by attribute on a clock field without an offset counts with an offset of 0 (cut point and choice
+  rule 2). Rule 2 compares, for each wait on the field, the later of its earliest arrival (entry time plus
+  its smallest fixed delay) and the end its date gives; with several waits, the last of them.
+- A day-level cut point is a whole number of days (the difference of the dates), so the candidates keep the
+  time of day of the entry time; a time-level one (hours, minutes) is exact. The bounds of the absolute
+  ordering conditions on a clock field are cut points too.
+- Validity is the behaviour re-evaluated one day of slip at a time for the first two months, then by bisection
+  up to 366 days, a change read as permanent (each condition is monotone in the slip: the clock moves forward,
+  a relative reference with it). It is a property of the value on every path a contact holding it can take
+  ("at any delay a contact can reach it with"), not of one case's path.
+- In the cover, a leaf holding a value below the minimum validity counts only for the targets no other leaf
+  reaches (``_effective_masks``).
+- Among the members of a contact class, a value whose validity is below the minimum validity counts against
+  the representative, after null and absent rows and before values on a named point.
+- Whether the exit criteria are why a branch is never crossed is found by walking every path that leaves by
+  the exit criteria on as if they were false (``_exit_shadow``): a branch those walks cross is unreachable
+  because of the exit criteria.
+
 The simulation itself lives in graph.py so that checks.py re-simulates with the same code.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import itertools
 import math
 import random
@@ -52,7 +97,9 @@ from typing import Optional
 from . import criteria, graph
 from .model import (
     GENERATED_KEY,
+    KIND_SMS,
     KIND_WAIT_ATTRIBUTE,
+    KIND_WAIT_DURATION,
     SOURCE_JOURNEY,
     ActionWindow,
     EqualityFilter,
@@ -80,15 +127,18 @@ from .model import (
     CoverageResult,
     FieldRef,
     Formula,
+    JourneyFilter,
     ManualAction,
     Outcome,
     Package,
     RandomBranch,
     RandomInfo,
+    RelativeDate,
     Scenario,
     Settings,
     Step,
     TableModel,
+    TimelinePoint,
     Value,
     Write,
     formula_conditions,
@@ -96,7 +146,10 @@ from .model import (
 )
 
 # Safety limits so a strange export cannot hang the generator. Both are reported when hit.
-MAX_CONTACT_COMBINATIONS = 1_000_000
+MAX_CONTACT_COMBINATIONS = 1_000_000   # per component of the contact-level fields (build_classes)
+MAX_CONTACT_CLASSES = 20_000
+MAX_PREFIX_STATES = 200_000          # partial assignments kept by the exact enumeration of a large component
+_UNSET = object()                    # a field not assigned yet (CoverageEngine._component_classes_by_prefix)
 MAX_SCENARIO_COMBINATIONS = 2_000_000
 MAX_PATHS = 400_000
 
@@ -107,8 +160,21 @@ KEY_MARKER = GENERATED_KEY         # stands for the generated key in the domain 
 TEXT_TYPES = ("Text", "EmailAddress", "Phone", "Locale")
 ORDER_OPERATORS_UP = ("GreaterThan", "GreaterThanOrEqual")
 ORDER_OPERATORS_DOWN = ("LessThan", "LessThanOrEqual")
-RANGE_OPERATORS = ORDER_OPERATORS_UP + ORDER_OPERATORS_DOWN + ("Between",)
+# Spec, step 3: "The same operators with an absolute date value keep the earlier reading" (as the ordering operators).
+DATE_ORDER_OPERATORS = ("After", "AtOrAfter", "Before", "AtOrBefore")
+RANGE_OPERATORS = ORDER_OPERATORS_UP + ORDER_OPERATORS_DOWN + ("Between",) + DATE_ORDER_OPERATORS
 RANGE_TYPES = ("Number", "Decimal", "Date")    # the field types whose ranges build_domain fills
+
+# Spec, step 3, "Exit criteria and goals": the coverage target of an exit criterion is the branch
+# (EXIT_PREFIX + criterion key, EXIT_OUTCOME) of the masks; its BranchStatus has the criterion key itself.
+EXIT_PREFIX = "EXIT:"
+EXIT_OUTCOME = "met"
+EXIT_LABEL = "criteri di uscita soddisfatti"
+EXIT_KIND = "exit"
+# Spec, step 3, "Validity of the data": "A value that no slip of up to a year changes is not perishable".
+MAX_SLIP_DAYS = 366
+SLIP_SCAN_DAYS = 62             # slips tried one day at a time before bisection (``_clock_validity``)
+MAX_SHADOW_PATHS = 100_000      # paths walked on past the exit criteria to explain unreachable branches
 
 
 # ---------------------------------------------------------------------------
@@ -196,6 +262,11 @@ def build_domain(field_type: str, conditions: list[Condition], nullable: bool, c
     the named values; a bound itself is never tried. Without such a condition the domain is the
     named values plus one 'other' value above them. A text field gets no value from an ordering
     operator or Between: no value inside a text range is chosen, and a warning says so.
+
+    Spec, step 3: "The same operators with an absolute date value keep the earlier reading", so After,
+    AtOrAfter, Before and AtOrBefore with an absolute value cut ranges like the ordering operators. A
+    condition with a relative date names no value and cuts no range here: a field that has one gets its
+    domain from ``CoverageEngine._clock_domain``.
     """
     warnings: list[str] = []
     values: list[Value] = []
@@ -213,7 +284,7 @@ def build_domain(field_type: str, conditions: list[Condition], nullable: bool, c
         named: list[str] = []
         bounds: list[str] = []
         for cond in conditions:
-            if cond.value is None:
+            if cond.value is None or cond.relative is not None:
                 continue
             if cond.operator in RANGE_OPERATORS:
                 bounds.extend(_range_bounds(cond))
@@ -239,7 +310,7 @@ def build_domain(field_type: str, conditions: list[Condition], nullable: bool, c
         ranges: list[str] = []
         for cond in conditions:
             v = cond.value
-            if v is None:
+            if v is None or cond.relative is not None:
                 continue
             if cond.operator in RANGE_OPERATORS:
                 if cond.operator not in ranges:
@@ -274,8 +345,8 @@ def build_domain(field_type: str, conditions: list[Condition], nullable: bool, c
 
 
 def _range_bounds(cond: Condition) -> list[str]:
-    """The bounds, as written, at which an ordering or Between condition cuts the values."""
-    if cond.value is None or cond.value_attribute is not None:
+    """The bounds, as written, at which an ordering or Between condition cuts the values (never a relative date)."""
+    if cond.value is None or cond.value_attribute is not None or cond.relative is not None:
         return []
     if cond.operator == "Between":
         bounds = criteria.between_bounds(cond.value)
@@ -375,8 +446,12 @@ class Leaf:
     waits: list[str]
     stop: str
     stop_detail: str
-    mask: int = 0                              # bitmask over split branches crossed
+    mask: int = 0                              # bitmask over split branches crossed, then exit criteria met
     unknown_from: Optional[str] = None         # the walk stopped here without reaching an exit
+    # Spec, step 3: the clock at every step, the SMS sent, the wait at whose end the exit criteria took it out.
+    timeline: list[TimelinePoint] = field(default_factory=list)
+    sms_sent: list[str] = field(default_factory=list)
+    exit_by_criteria: Optional[str] = None
 
     @property
     def deterministic(self) -> bool:
@@ -385,6 +460,32 @@ class Leaf:
     @property
     def end_activity_key(self) -> Optional[str]:
         return self.steps[-1].activity_key if self.steps else None
+
+
+@dataclass(frozen=True)
+class ClockPoint:
+    """One moment at which a condition on a clock field is evaluated (spec, step 3, "Values of a date field
+    read with relative dates or by a wait with an offset": "every fixed delay with which a contact can reach
+    that split").
+
+    ``site`` is the decision split, or EXIT_PREFIX + the criterion key for an exit criterion (evaluated at the
+    end of a wait). The clock is the entry time plus ``delay`` days, or the end of one of the ``anchors`` when
+    that is later: the waits by attribute on the field that precede the site on some path.
+    """
+    cond: Condition
+    site: str
+    delay: float
+    anchors: tuple[str, ...] = ()
+
+
+@dataclass
+class _SubClass:
+    """The class of one component of the contact-level fields (``CoverageEngine.build_classes``)."""
+    values: dict[FieldRef, Value]                  # the representative values of the component's fields
+    groups: dict[int, tuple[bool, ...]]            # predicate index -> its truths at its moments
+    count: int                                     # how many combinations of the component it stands for
+    first: tuple[int, ...]                         # domain indexes of its first member in product order
+    best: tuple[int, ...]                          # the preference of the representative
 
 
 @dataclass
@@ -435,6 +536,9 @@ class CoverageEngine:
         self.table_model = table_model
         self.settings = settings
         self.now = generation_time or settings.generation_time or datetime.now()
+        # Spec, step 3, "The clock": "The clock starts at the entry time, a setting whose default is the
+        # generation time".
+        self.entry_time = settings.entry_time or self.now
         self.schema = graph.Schema(package.tables)
         self.warnings: list[str] = []
         # Spec, "Row present or absent": lower-case table -> its field linked to the contact key (canonical).
@@ -442,10 +546,38 @@ class CoverageEngine:
         for ref in table_model.existence_tested.values():
             linked = self.schema.canonical(ref)
             self.row_fields[linked[0].lower()] = linked
+        # Spec, step 3, "Columns the entry query derives and columns it copies": member -> representative.
+        self.alias_of: dict[FieldRef, FieldRef] = self._alias_map()
         self.walker = graph.Walker(self.journey, self.schema, package.emails,
                                    settings.case_insensitive_text, self.now, settings.date_format,
-                                   row_fields=self.row_fields)
+                                   row_fields=self.row_fields, entry_time=self.entry_time,
+                                   ends_at_once_when_unknown=self._wait_ends_at_once)
         self.walker.on_decision = self._observe_decision
+        # Spec, step 3: the exit criteria the walker evaluates at the end of every wait, and the fixed delays
+        # with which a contact reaches each activity (days; the waits by attribute count zero).
+        self.exits: list[JourneyFilter] = graph.evaluable_exits(self.journey)
+        self.delays, self.delay_warnings = graph.fixed_delays(self.journey)
+        # The exit criteria are only ever evaluated at the end of a wait: without a reachable wait they read no
+        # field and take no contact out (their targets are then not covered, with that reason).
+        self.waits_reached_by_paths = any(a.kind in graph.WAIT_KINDS and self.delays.get(a.key)
+                                          for a in self.journey.activities.values())
+        self.active_exits: list[JourneyFilter] = self.exits if self.waits_reached_by_paths else []
+        self.preds = graph.predecessors(self.journey)
+        self._ancestor_cache: dict[str, set[str]] = {}
+        # Spec, step 3, "Validity of the data": field -> domain value -> validity in days (None: not perishable),
+        # the condition that reads it differently first, and the cut points of each clock field (days).
+        self.validity: dict[FieldRef, dict[Value, Optional[int]]] = {}
+        self.validity_change: dict[FieldRef, dict[Value, Optional[ClockPoint]]] = {}
+        self.cut_points: dict[FieldRef, list[float]] = {}
+        self.condition_sites: dict[FieldRef, list[tuple[Condition, str]]] = {}
+        # Spec, step 3, "Exit criteria and goals": per wait, the paths that leave there by the exit criteria and
+        # those that go past it; the criteria met there; the leaving paths, to walk them on (``_exit_shadow``).
+        self.exited_at: dict[str, int] = {}
+        self.passed_at: dict[str, int] = {}
+        self.exit_met_at: dict[str, set[str]] = {}
+        self.exit_states: list[tuple[ContactClass, graph.WalkState, dict[FieldRef, Value]]] = []
+        self._shadow: Optional[dict[BranchRef, set[str]]] = None
+        self.case_exits: dict[str, tuple[list[BranchRef], list[BranchRef]]] = {}
         # filled by run()
         self.fields: list[FieldRef] = []
         self.conditions_by_field: dict[FieldRef, list[Condition]] = {}
@@ -470,25 +602,67 @@ class CoverageEngine:
         # field gets no value (CoverageResult.unsupported_reasons): key -> why.
         self.stopped_at: dict[str, str] = {}
 
+    # -- aliases (spec, step 3) ------------------------------------------------------------
+
+    def _alias_map(self) -> dict[FieldRef, FieldRef]:
+        """Spec, step 3: "A column of the entry table copied as a plain column from a source table ... holds the
+        same value as its source: the two fields are one variable for the coverage". Each group of
+        ``TableModel.aliases`` is represented by its first member whose table is not the entry table (the source
+        column: the entry copy is derived from it), else by its first member. Member -> representative, canonical
+        refs, representatives left out."""
+        entry = (self.table_model.entry_table or "").lower()
+        out: dict[FieldRef, FieldRef] = {}
+        for group in self.table_model.aliases:
+            members = [self.schema.canonical(ref) for ref in group]
+            if not members:
+                continue
+            representative = next((m for m in members if m[0].lower() != entry), members[0])
+            for member in members:
+                if member != representative:
+                    out[member] = representative
+        return out
+
+    def _var(self, ref: FieldRef) -> FieldRef:
+        """The variable a canonical field ref stands for: its alias representative, or itself."""
+        return self.alias_of.get(ref, ref)
+
+    def _cond_var(self, cond: Condition) -> FieldRef:
+        return self._var(self.schema.canonical((cond.table, cond.field)))
+
+    def _wait_ends_at_once(self, ref: FieldRef) -> bool:
+        """graph.Walker: a wait by attribute whose field is not decided ends at once unless the coverage lists
+        values for it (a field a condition reads); then the walk stops so that the exploration branches on it."""
+        return self._var(ref) not in self.domains
+
     # -- step 3 and 4: fields, levels, domains ------------------------------------------
 
     def collect_fields(self) -> None:
-        """Every field read by a decision split, in order of first appearance."""
+        """Every field read by a decision split or by an evaluable exit criterion, in order of first appearance
+        (splits first). Spec, step 3: the exit criteria use "the same operators, data sources and relative dates
+        as a decision split". Conditions on any member of an alias group attach to its representative."""
+        sites: list[tuple[Condition, str]] = []
         for activity in self.journey.activities.values():
             if activity.kind != KIND_DECISION:
                 continue
             for outcome in activity.outcomes:
                 if outcome.unsupported_reason:
                     continue   # never evaluated: the walk stops there
-                for cond in formula_conditions(outcome.formula):
-                    ref = self.schema.canonical((cond.table, cond.field))
-                    if ref not in self.conditions_by_field:
-                        self.fields.append(ref)
-                        self.conditions_by_field[ref] = []
-                    self.conditions_by_field[ref].append(cond)
-        journey_data = {self.schema.canonical((c.table, c.field)) for conds in self.conditions_by_field.values()
+                sites.extend((cond, activity.key) for cond in formula_conditions(outcome.formula))
+        for exit_ in self.active_exits:
+            sites.extend((cond, EXIT_PREFIX + exit_.key) for cond in formula_conditions(exit_.formula))
+        for cond, site in sites:
+            ref = self._cond_var(cond)
+            if ref not in self.conditions_by_field:
+                self.fields.append(ref)
+                self.conditions_by_field[ref] = []
+                self.condition_sites[ref] = []
+            self.conditions_by_field[ref].append(cond)
+            self.condition_sites[ref].append((cond, site))
+        journey_data = {self._cond_var(c) for conds in self.conditions_by_field.values()
                         for c in conds if c.source == SOURCE_JOURNEY}
         for ref in self.fields:
+            read_by = ("da uno split" if any(not site.startswith(EXIT_PREFIX) for _, site in self.condition_sites[ref])
+                       else "dai criteri di uscita (exit criteria)")
             level = self.table_model.field_levels.get(ref)
             if level is None and ref in journey_data:
                 # Spec, "Data sources of a condition": Journey Data is a column of the entry row, one per contact.
@@ -496,11 +670,11 @@ class CoverageEngine:
             elif level is None:
                 level = LEVEL_CONTACT
                 self.warnings.append(
-                    f"il campo {ref[0]}.{ref[1]} è letto da uno split, ma la sua tabella non è collegata alla tabella di ingresso: "
+                    f"il campo {ref[0]}.{ref[1]} è letto {read_by}, ma la sua tabella non è collegata alla tabella di ingresso: "
                     "è trattato come campo a livello di contatto (assunzione)")
             self.levels[ref] = level
             if self.schema.table(ref[0]) is None or self.schema.table(ref[0]).field(ref[1]) is None:
-                self.warnings.append(f"il campo {ref[0]}.{ref[1]} è letto da uno split, ma non è negli schemi dell'export: è trattato come testo che ammette null")
+                self.warnings.append(f"il campo {ref[0]}.{ref[1]} è letto {read_by}, ma non è negli schemi dell'export: è trattato come testo che ammette null")
         self.contact_fields = [f for f in self.fields if self.levels[f] == LEVEL_CONTACT]
         self.scenario_fields = [f for f in self.fields if self.levels[f] == LEVEL_SCENARIO]
 
@@ -532,10 +706,15 @@ class CoverageEngine:
                         "quindi una condizione che lo confronta con un valore non può mai essere vera")
                 continue
             scale = field.scale if field is not None else None
-            domain, other, warnings = build_domain(ftype, conds, self.schema.is_nullable(ref),
-                                                   self.settings.case_insensitive_text, self.settings.date_format, length,
-                                                   scale)
-            if ftype in ("Number", "Decimal", "Date") and any(c.operator in RANGE_OPERATORS for c in conds):
+            clock = self._is_clock_field(ref, ftype)
+            if clock:
+                domain, other, warnings = self._clock_domain(ref, conds, self.schema.is_nullable(ref)), None, []
+            else:
+                domain, other, warnings = build_domain(ftype, conds, self.schema.is_nullable(ref),
+                                                       self.settings.case_insensitive_text, self.settings.date_format,
+                                                       length, scale)
+            if (not clock and ftype in ("Number", "Decimal", "Date")
+                    and any(c.operator in RANGE_OPERATORS and c.relative is None for c in conds)):
                 self.named_points[ref] = {c.value for c in conds if c.operator not in RANGE_OPERATORS}
             for w in warnings:
                 self.warnings.append(f"{ref[0]}.{ref[1]}: {w}")
@@ -549,6 +728,10 @@ class CoverageEngine:
                 self.warnings.append(
                     f"{ref[0]}.{ref[1]} è letto da uno split ed è fissato dalla entry query: i contatti che entrano "
                     f"nel journey hanno sempre {shown}, quindi si prova solo quel valore")
+                if clock:
+                    days, change = self._clock_validity(ref, value)
+                    self.validity[ref] = {value: days}
+                    self.validity_change[ref] = {value: change}
             elif ref in not_null and None in domain:
                 domain = [v for v in domain if v is not None]
                 self.warnings.append(
@@ -578,7 +761,15 @@ class CoverageEngine:
 
     def _entry_pins(self) -> tuple[dict[FieldRef, Value], set[FieldRef]]:
         """Fields pinned by the entry query: equality and IS NULL filters, literal and current-date
-        select expressions (every entry row gets that value), and the fields filtered IS NOT NULL."""
+        select expressions (every entry row gets that value), and the fields filtered IS NOT NULL.
+        Keyed by variable (alias representative)."""
+        pinned, not_null = self._entry_pins_by_field()
+        out: dict[FieldRef, Value] = {}
+        for ref, value in pinned.items():
+            out.setdefault(self._var(ref), value)
+        return out, {self._var(ref) for ref in not_null}
+
+    def _entry_pins_by_field(self) -> tuple[dict[FieldRef, Value], set[FieldRef]]:
         query = self.table_model.entry_query
         pinned: dict[FieldRef, Value] = {}
         not_null: set[FieldRef] = set()
@@ -622,19 +813,430 @@ class CoverageEngine:
                 matches.append((table.name, table.field(column.column).name))
         return matches[0] if len(matches) == 1 else None
 
+    # -- the clock: relative dates and waits by attribute with an offset (spec, step 3) -------
+
+    def _is_clock_field(self, ref: FieldRef, ftype: str) -> bool:
+        """Spec, step 3: "For a field with at least one relative condition or one wait by attribute with an
+        offset" the values are chosen as offsets from the entry time. Only a Date field."""
+        if ftype != "Date":
+            return False
+        if any(c.relative is not None for c in self.conditions_by_field.get(ref, [])):
+            return True
+        return any(w.wait_offset_amount for w in self._attribute_waits(ref))
+
+    def _attribute_waits(self, ref: FieldRef) -> list[Activity]:
+        """The waits by attribute whose date field is the variable ``ref``, in export order."""
+        return [a for a in self.journey.activities.values()
+                if a.kind == KIND_WAIT_ATTRIBUTE and a.wait_field is not None
+                and self._var(self.schema.canonical(a.wait_field)) == ref]
+
+    def _ancestors(self, key: str) -> set[str]:
+        """The activities from which ``key`` can be reached along the outcomes (any path)."""
+        found = self._ancestor_cache.get(key)
+        if found is None:
+            found = set()
+            stack = list(self.preds.get(key, ()))
+            while stack:
+                k = stack.pop()
+                if k in found:
+                    continue
+                found.add(k)
+                stack.extend(self.preds.get(k, ()))
+            self._ancestor_cache[key] = found
+        return found
+
+    def _wait_end_delays(self) -> list[tuple[str, float]]:
+        """``(wait key, delay in days at its end)`` for every fixed delay of every wait: the moments at which the
+        exit criteria are evaluated (spec, step 3: "when the contact's time in a wait activity expires"). A wait
+        by duration adds its amount (graph.fixed_wait_minutes); a wait by attribute and a send-time wait add 0."""
+        out: list[tuple[str, float]] = []
+        for activity in self.journey.activities.values():
+            if activity.kind not in graph.WAIT_KINDS:
+                continue
+            extra = graph.fixed_wait_minutes(activity) or 0
+            for delay in sorted(self.delays.get(activity.key, ())):
+                out.append((activity.key, (round(delay * graph.MINUTES_PER_DAY) + extra) / graph.MINUTES_PER_DAY))
+        return out
+
+    def _site_moments(self, site: str) -> list[tuple[float, set[str]]]:
+        """``(delay, activities before it)`` for every moment a condition at ``site`` is evaluated: each fixed
+        delay of a decision split; the end of every wait for an exit criterion (the wait itself counts as before:
+        its end is the moment)."""
+        if site.startswith(EXIT_PREFIX):
+            return [(delay, {key} | self._ancestors(key)) for key, delay in self._wait_end_delays()]
+        return [(delay, self._ancestors(site)) for delay in sorted(self.delays.get(site, ()))]
+
+    def _clock_points(self, ref: FieldRef) -> list[ClockPoint]:
+        """Every (condition, delay) at which a condition on the clock field ``ref`` is evaluated, with the waits by
+        attribute on the field that precede it (the anchors of its clock), in order of the conditions."""
+        waits = self._attribute_waits(ref)
+        points: list[ClockPoint] = []
+        seen: set[tuple] = set()
+        for index, (cond, site) in enumerate(self.condition_sites.get(ref, [])):
+            for delay, before in self._site_moments(site):
+                anchors = tuple(w.key for w in waits if w.key in before)
+                key = (index, delay, anchors)
+                if key not in seen:
+                    seen.add(key)
+                    points.append(ClockPoint(cond, site, delay, anchors))
+        return points
+
+    def _point_clock(self, point: ClockPoint, moment: Optional[datetime], slip: int) -> datetime:
+        """The clock at ``point`` for a contact whose field holds ``moment``, with the entry time slipped by
+        ``slip`` days: the entry time plus the delay, or the end of an anchor wait when that is later (spec,
+        step 3, "The clock": the wait "holds the contact until the date in its field plus its offset")."""
+        now = self.entry_time + timedelta(days=slip + point.delay)
+        if moment is not None:
+            for key in point.anchors:
+                try:
+                    end = graph.wait_end(self.journey.activities[key], moment)
+                except criteria.UnsupportedOperator:
+                    continue
+                if end > now:
+                    now = end
+        return now
+
+    def _clock_vector(self, points: list[ClockPoint], value: Value, slip: int = 0) -> tuple:
+        """The truth of every point for ``value`` (None where the condition cannot be evaluated)."""
+        moment = self.walker.read_date(value)
+        out = []
+        for point in points:
+            try:
+                out.append(criteria.evaluate_condition(point.cond, value, "Date", self.settings.case_insensitive_text,
+                                                       now=self._point_clock(point, moment, slip)))
+            except criteria.UnsupportedOperator:
+                out.append(None)
+        return tuple(out)
+
+    def _behaviour(self, ref: FieldRef, value: Value, slip: int, intern: dict[tuple, int],
+                   visited: Optional[set] = None) -> int:
+        """How a contact whose clock field ``ref`` holds ``value`` goes through the journey when the entry time
+        slips by ``slip`` days, every other field undecided: an interned signature of the decisions on every path.
+
+        Spec, step 3: "Candidates that take the same branches at every split that reads the field, whatever the
+        delay, are one class". The journey is walked from the start with the clock of each path (waits by duration
+        advance it, a wait by attribute on the field holds the contact until its end, a wait by attribute on
+        another field counts 0, as in the fixed delays). At a decision split each outcome's formula is reduced
+        with the value (``_residual``): false, the next outcome is tried; true, it is taken; undecided (it also
+        depends on other fields), both it and the next outcomes are followed. At the end of every wait the exit
+        criteria are reduced in the same way (true: the path ends there). Engagement and random splits follow
+        every outcome. Update contact writes into the field are read by later Contact Data conditions. The
+        signature keeps the activity keys, outcomes and residuals, never the clock, so two values that decide the
+        same way on the same paths have the same signature even when a wait on the field ends at another time.
+        ``visited`` collects ``(site, days from the entry)`` for every decision split and exit evaluation."""
+        entry = self.entry_time + timedelta(days=slip)
+        activities = self.journey.activities
+        memo: dict[tuple, int] = {}
+        on_path: set[str] = set()
+
+        def sign(structure: tuple) -> int:
+            found = intern.get(structure)
+            if found is None:
+                found = intern[structure] = len(intern)
+            return found
+
+        def readers(written: dict[FieldRef, Value]):
+            def lookup(r: FieldRef):
+                if r in written:
+                    return written[r]
+                return value if self._var(r) == ref else graph.UNKNOWN
+
+            def snapshot(r: FieldRef):
+                return value if self._var(r) == ref else graph.UNKNOWN
+            return lookup, snapshot
+
+        def offset(clock: datetime) -> float:
+            return round((clock - entry) / timedelta(days=1), 6)
+
+        def visit(key: Optional[str], clock: datetime, written: tuple) -> int:
+            if key is None:
+                return sign(("E",))
+            state = (key, clock, written)
+            if state in memo:
+                return memo[state]
+            activity = activities.get(key)
+            if activity is None:
+                return sign(("dangling", key))
+            if key in on_path:
+                return sign(("loop", key))
+            on_path.add(key)
+            written_map = dict(written)
+            lookup, snapshot = readers(written_map)
+            nxt = activity.outcomes[0].next if activity.outcomes else None
+            if activity.kind == KIND_DECISION:
+                if visited is not None:
+                    visited.add((key, offset(clock)))
+                remainder = [o for o in activity.outcomes if o.is_remainder or o.formula is None]
+                parts: list[tuple] = []
+                for outcome in [o for o in activity.outcomes if o not in remainder] + remainder:
+                    if outcome.is_remainder or outcome.formula is None:
+                        parts.append((outcome.key, True, visit(outcome.next, clock, written)))
+                        break
+                    if outcome.unsupported_reason:
+                        parts.append((outcome.key, "unsupported"))
+                        break
+                    result = self._residual(outcome.formula, lookup, clock, snapshot)
+                    if result is False:
+                        parts.append((outcome.key, False))
+                        continue
+                    parts.append((outcome.key, result, visit(outcome.next, clock, written)))
+                    if result is True:
+                        break
+                signature = sign(("D", key, tuple(parts)))
+            elif activity.kind in (KIND_ENGAGEMENT, KIND_RANDOM):
+                signature = sign(("C", key, tuple(visit(o.next, clock, written) for o in activity.outcomes)))
+            elif activity.kind in graph.WAIT_KINDS:
+                end = clock
+                if activity.kind == KIND_WAIT_DURATION:
+                    end = clock + timedelta(minutes=graph.fixed_wait_minutes(activity) or 0)
+                elif activity.kind == KIND_WAIT_ATTRIBUTE and activity.wait_field is not None \
+                        and self._var(self.schema.canonical(activity.wait_field)) == ref:
+                    moment = self.walker.read_date(lookup(self.schema.canonical(activity.wait_field)))
+                    if moment is not None:
+                        try:
+                            end = max(clock, graph.wait_end(activity, moment))
+                        except criteria.UnsupportedOperator:
+                            pass
+                exits: list[tuple] = []
+                leaves = False
+                for exit_ in self.active_exits:
+                    if visited is not None:
+                        visited.add((EXIT_PREFIX + exit_.key, offset(end)))
+                    result = self._residual(exit_.formula, lookup, end, snapshot)
+                    if result is True:
+                        leaves = True
+                        break
+                    if result is not False:
+                        exits.append((exit_.key, result))
+                if leaves:
+                    signature = sign(("X", key))
+                else:
+                    signature = sign(("W", key, tuple(exits), visit(nxt, end, written)))
+            elif activity.kind == KIND_UPDATE:
+                changed = dict(written_map)
+                for w in activity.writes:
+                    member = self.schema.canonical((w.table, w.field))
+                    if self._var(member) == ref:
+                        changed[member] = (clock.strftime(self.settings.date_format) if w.value == graph.DATETIME_NOW
+                                           else w.value)
+                signature = visit(nxt, clock, tuple(sorted(changed.items(), key=lambda kv: kv[0])))
+            elif activity.kind == KIND_UNSUPPORTED:
+                signature = sign(("U", key))
+            else:
+                signature = visit(nxt, clock, written)
+            on_path.discard(key)
+            memo[state] = signature
+            return signature
+
+        return visit(self.journey.start_key, entry, ())
+
+    def _clock_validity(self, ref: FieldRef, value: Value,
+                        intern: Optional[dict[tuple, int]] = None) -> tuple[Optional[int], Optional[ClockPoint]]:
+        """Spec, step 3, "Validity of the data": "the number of whole days the entry time can slip before any
+        condition on the field, at any delay a contact can reach it with, reads differently; the generator
+        computes it by re-evaluating the conditions with the entry time moved by one day at a time (so an
+        exclusive operator gives one day less than the distance from the cut point). A value that no slip of up
+        to a year changes is not perishable".
+
+        The largest k such that every slip j <= k gives the behaviour of slip 0 (``_behaviour``: the same decisions
+        on the same paths), and the condition that reads the value differently first; (None, None) when no slip up
+        to MAX_SLIP_DAYS changes it. The slips are tried one day at a time for the first SLIP_SCAN_DAYS; beyond, the
+        behaviour of slip MAX_SLIP_DAYS is compared and the first change found by bisection, reading a change as
+        permanent (each condition is monotone in the slip: the clock only moves forward, a relative reference
+        with it)."""
+        intern = {} if intern is None else intern
+        visited: set = set()
+        base = self._behaviour(ref, value, 0, intern, visited)
+        changed_at: Optional[int] = None
+        for slip in range(1, SLIP_SCAN_DAYS + 1):
+            if self._behaviour(ref, value, slip, intern) != base:
+                changed_at = slip
+                break
+        if changed_at is None:
+            if self._behaviour(ref, value, MAX_SLIP_DAYS, intern) == base:
+                return None, None
+            low, high = SLIP_SCAN_DAYS, MAX_SLIP_DAYS     # slip ``low`` behaves as slip 0, slip ``high`` does not
+            while high - low > 1:
+                middle = (low + high) // 2
+                if self._behaviour(ref, value, middle, intern) == base:
+                    low = middle
+                else:
+                    high = middle
+            changed_at = high
+        return changed_at - 1, self._changed_point(ref, value, changed_at, visited)
+
+    def _changed_point(self, ref: FieldRef, value: Value, slip: int, visited: set) -> Optional[ClockPoint]:
+        """The condition that reads ``value`` differently at ``slip`` days: the first clock point of the field whose
+        truth changes, preferring one evaluated on the value's own paths (``visited``)."""
+        points = self._clock_points(ref)
+        before = self._clock_vector(points, value, 0)
+        after = self._clock_vector(points, value, slip)
+        changed = [p for p, a, b in zip(points, before, after) if a != b]
+        on_paths = [p for p in changed if (p.site, round(p.delay, 6)) in visited]
+        return (on_paths or changed or [None])[0]
+
+    def _days_from_entry(self, moment: datetime, day_level: bool) -> float:
+        """A moment as days from the entry time: whole days between the dates at day level (the candidates keep
+        the entry's time of day), the exact fraction otherwise."""
+        if day_level:
+            return float((moment.date() - self.entry_time.date()).days)
+        return round((moment - self.entry_time) / timedelta(days=1), 6)
+
+    def _cut_points(self, ref: FieldRef, points: list[ClockPoint], conds: list[Condition]) -> list[float]:
+        """Spec, step 3: "the cut points in days: for each relative condition, n plus every fixed delay with which
+        a contact can reach that split ...; for each wait by attribute on the field, minus its offset plus the
+        same delays (the value at which the wait ends exactly when the contact reaches it)". The reference of a
+        relative condition is ``criteria.shift_date`` of the clock (months and years are calendar steps); the
+        bounds of the absolute ordering conditions on the field are cut points too."""
+        cuts: set[float] = set()
+        for point in points:
+            rel = point.cond.relative
+            if rel is None:
+                continue
+            try:
+                moment = criteria.shift_date(self.entry_time + timedelta(days=point.delay), rel)
+                cuts.add(self._days_from_entry(moment, criteria.is_day_level(rel)))
+            except criteria.UnsupportedOperator:
+                continue
+        for wait in self._attribute_waits(ref):
+            amount = wait.wait_offset_amount or 0
+            unit = graph.offset_unit(wait.wait_offset_unit) if amount else "days"
+            if unit is None:
+                continue
+            for delay in sorted(self.delays.get(wait.key, ())):
+                reached = self.entry_time + timedelta(days=delay)
+                try:
+                    moment = (criteria.shift_date(reached, RelativeDate(sign=-1 if amount > 0 else 1, amount=abs(amount),
+                                                                        unit=unit)) if amount else reached)
+                except criteria.UnsupportedOperator:
+                    continue
+                cuts.add(self._days_from_entry(moment, False))
+        for cond in conds:
+            if cond.relative is not None or cond.operator not in RANGE_OPERATORS:
+                continue
+            for bound in _range_bounds(cond):
+                parsed = _parse_date(bound.strip(), self.settings.date_format)
+                if parsed is not None:
+                    cuts.add(self._days_from_entry(parsed, bool(_DATE_ONLY.fullmatch(bound.strip()))))
+        return sorted(cuts)
+
+    def _clock_candidates(self, cuts: list[float], conds: list[Condition], nullable: bool) -> list[Value]:
+        """Spec, step 3: "The candidate values are the entry time moved by every cut point and by every cut point
+        plus or minus one and two days, plus the absolute values named by the other conditions, plus null when
+        the schema allows it." Written in the date format of the CSVs, in order of the cut points."""
+        fmt = self.settings.date_format
+        out: list[Value] = []
+        seen: set[str] = set()
+        for cut in cuts or [0.0]:
+            for step in (-2, -1, 0, 1, 2):
+                text = (self.entry_time + timedelta(days=cut + step)).strftime(fmt)
+                if text not in seen:
+                    seen.add(text)
+                    out.append(text)
+        for cond in conds:
+            if (cond.relative is None and cond.value is not None and cond.value_attribute is None
+                    and cond.operator not in RANGE_OPERATORS and cond.value not in seen):
+                seen.add(cond.value)
+                out.append(cond.value)
+        if nullable:
+            out.append(None)
+        return out
+
+    def _clock_domain(self, ref: FieldRef, conds: list[Condition], nullable: bool) -> list[Value]:
+        """Spec, step 3, "Values of a date field read with relative dates or by a wait with an offset":
+        "Candidates that take the same branches at every split that reads the field, whatever the delay, are one
+        class; the generator keeps one value per class". A class here is a behaviour (``_behaviour``): the same
+        decisions on the same paths, each split evaluated with the clock of the path that reaches it (a delay with
+        which only other values reach a split does not separate two values). One representative per class
+        (``_clock_representative``), sorted by date, null last; their validity is kept in ``validity``, the cut
+        points in ``cut_points``."""
+        points = self._clock_points(ref)
+        cuts = self._cut_points(ref, points, conds)
+        candidates = self._clock_candidates(cuts, conds, nullable)
+        fmt = self.settings.date_format
+        cut_texts = {(self.entry_time + timedelta(days=cut)).strftime(fmt) for cut in cuts}
+        intern: dict[tuple, int] = {}
+        classes: dict[int, list[Value]] = {}
+        for value in candidates:
+            classes.setdefault(self._behaviour(ref, value, 0, intern), []).append(value)
+        validity = {value: self._clock_validity(ref, value, intern) for value in candidates}
+        waits = self._attribute_waits(ref)
+        chosen = [self._clock_representative(members, validity, cut_texts, waits) for members in classes.values()]
+        chosen.sort(key=lambda v: (v is None, self.walker.read_date(v) or datetime.max, str(v)))
+        self.cut_points[ref] = cuts
+        self.validity[ref] = {v: validity[v][0] for v in chosen}
+        self.validity_change[ref] = {v: validity[v][1] for v in chosen}
+        return chosen
+
+    def _clock_representative(self, members: list[Value], validity: dict, cut_texts: set[str],
+                              waits: list[Activity]) -> Value:
+        """Spec, step 3: one value per class, "chosen in this order: (1) among the candidates whose validity ...
+        reaches the setting "minimum validity of the data", or all of them when none does; (2) the one that makes
+        the waits by attribute on the field end soonest ...; (3) not on a cut point; (4) the longest validity;
+        (5) the earliest date; null never represents a class that has a non-null member." A value that is not
+        perishable reaches any minimum and has the longest validity."""
+        pool = [m for m in members if m is not None] or list(members)
+        minimum = self.settings.min_validity_days
+        reaching = [m for m in pool if validity[m][0] is None or validity[m][0] >= minimum]
+        pool = reaching or pool
+
+        def key(value: Value):
+            moment = self.walker.read_date(value)
+            days = validity[value][0]
+            return (self._waits_end(waits, moment) if waits else self.entry_time, value in cut_texts,
+                    -(days if days is not None else MAX_SLIP_DAYS + 1), moment or datetime.max, str(value))
+        return min(pool, key=key)
+
+    def _waits_end(self, waits: list[Activity], moment: Optional[datetime]) -> datetime:
+        """When the waits by attribute on a field holding ``moment`` have all ended, at the earliest: for each, the
+        later of its earliest arrival (the entry time plus its smallest fixed delay) and the end its date gives."""
+        latest = self.entry_time
+        for wait in waits:
+            delays = self.delays.get(wait.key) or {0.0}
+            end = self.entry_time + timedelta(days=min(delays))
+            if moment is not None:
+                try:
+                    end = max(end, graph.wait_end(wait, moment))
+                except criteria.UnsupportedOperator:
+                    pass
+            latest = max(latest, end)
+        return latest
+
+    def _point_text(self, point: ClockPoint) -> str:
+        """The condition of a clock point, in plain words, for the report."""
+        text = f"la condizione {formula_text(point.cond)}"
+        if point.site.startswith(EXIT_PREFIX):
+            return text + " dei criteri di uscita (exit criteria)"
+        activity = self.journey.activities.get(point.site)
+        name = activity.name if activity is not None and activity.name else point.site
+        return text + (f" dello split '{name}' ({point.site})" if name != point.site else f" dello split '{point.site}'")
+
     # -- contact classes ----------------------------------------------------------------
 
     def contact_predicates(self) -> list[Formula]:
         """A pure contact-level outcome formula is one predicate; of a mixed formula, each
-        contact-level condition is one predicate. Classes are the distinct truth vectors."""
-        preds: list[Formula] = []
-        seen: set[str] = set()
+        contact-level condition is one predicate. Classes are the distinct truth vectors.
+        The exit criteria give predicates in the same way (spec, step 3)."""
+        return [formula for formula, _ in self._contact_predicate_points()]
 
-        def add(f: Formula) -> None:
+    def _contact_predicate_points(self) -> list[tuple[Formula, tuple[tuple[float, tuple[str, ...]], ...]]]:
+        """The predicates of ``contact_predicates``, each with the moments it is evaluated at: ``(delay,
+        anchor waits)``. Spec, step 3: a condition can "compare a date with Today", so a predicate holding a
+        relative date is evaluated at every fixed delay of its split, and at the end of every wait for an exit
+        criterion, each moment one entry of the truth vector; the clock is the entry time plus the delay, or the
+        end of a wait by attribute on a contact-level field before the site when that is later. Any other
+        predicate does not depend on the clock and is evaluated once, at the entry time."""
+        preds: list[Formula] = []
+        moments: dict[str, list[tuple[float, tuple[str, ...]]]] = {}
+
+        def add(f: Formula, site: str) -> None:
             key = formula_text(f)
-            if key not in seen:
-                seen.add(key)
+            if key not in moments:
+                moments[key] = []
                 preds.append(f)
+            for moment in self._predicate_moments(f, site):
+                if moment not in moments[key]:
+                    moments[key].append(moment)
 
         # A field rewritten by an update-contact step can change the truth of a formula along the
         # path, so such formulas are split into their conditions: classes then stay exact. Journey Data
@@ -647,57 +1249,301 @@ class CoverageEngine:
         def may_change(c: Condition, ref: FieldRef) -> bool:
             return c.source != SOURCE_JOURNEY and (ref in written or ref[0].lower() in inserting)
 
+        formulas: list[tuple[Formula, str]] = []
         for activity in self.journey.activities.values():
             if activity.kind != KIND_DECISION:
                 continue
             for outcome in activity.outcomes:
                 if outcome.formula is None or outcome.unsupported_reason:
                     continue
-                conds = formula_conditions(outcome.formula)
-                refs = [self.schema.canonical((c.table, c.field)) for c in conds]
-                levels = {self.levels[r] for r in refs}
-                if levels == {LEVEL_CONTACT} and not any(may_change(c, r) for c, r in zip(conds, refs)):
-                    add(outcome.formula)
-                elif LEVEL_CONTACT in levels:
-                    for c in conds:
-                        if self.levels[self.schema.canonical((c.table, c.field))] == LEVEL_CONTACT:
-                            add(c)
-        return preds
+                formulas.append((outcome.formula, activity.key))
+        formulas.extend((exit_.formula, EXIT_PREFIX + exit_.key) for exit_ in self.active_exits)
+        for formula, site in formulas:
+            conds = formula_conditions(formula)
+            refs = [self.schema.canonical((c.table, c.field)) for c in conds]
+            levels = {self.levels[self._var(r)] for r in refs}
+            if levels == {LEVEL_CONTACT} and not any(may_change(c, r) for c, r in zip(conds, refs)):
+                add(formula, site)
+            elif LEVEL_CONTACT in levels:
+                for c in conds:
+                    if self.levels[self._cond_var(c)] == LEVEL_CONTACT:
+                        add(c, site)
+        return [(f, tuple(moments[formula_text(f)])) for f in preds]
+
+    def _predicate_moments(self, formula: Formula, site: str) -> list[tuple[float, tuple[str, ...]]]:
+        """The moments a predicate at ``site`` is evaluated at (see ``_contact_predicate_points``)."""
+        if not any(c.relative is not None for c in formula_conditions(formula)):
+            return [(0.0, ())]
+        waits = [a for a in self.journey.activities.values()
+                 if a.kind == KIND_WAIT_ATTRIBUTE and a.wait_field is not None
+                 and self.levels.get(self._var(self.schema.canonical(a.wait_field))) == LEVEL_CONTACT]
+        out: list[tuple[float, tuple[str, ...]]] = []
+        for delay, before in self._site_moments(site):
+            moment = (delay, tuple(w.key for w in waits if w.key in before))
+            if moment not in out:
+                out.append(moment)
+        return out
+
+    def _component_classes_by_prefix(self, fields: list[FieldRef], pred_indexes: list[int], preds,
+                                     reads) -> Optional[list["_SubClass"]]:
+        """The classes of a component too large to enumerate, found exactly field by field.
+
+        The fields are assigned in product order. After each field, two partial assignments whose predicates are
+        left with the same residual (each formula simplified with the values assigned so far: decided conditions
+        replaced by their truth, AND and OR reduced) have the same completions and the same truths, so they merge:
+        their member counts add up; the representative is the one with the smaller (preference, index vector) and
+        the first member the smaller index vector, since the preference is a sum over the fields with an order
+        invariant under translation. The classes, counts, representatives and first members are those of the full
+        product. None when the residuals do not merge enough (MAX_PREFIX_STATES); the caller then truncates."""
+        instances = [(k, m, delay, anchors) for k in pred_indexes for m, (delay, anchors) in enumerate(preds[k][1])]
+        reads_of = {k: reads[k] for k in pred_indexes}
+        memo: dict[tuple, object] = {}
+
+        def residuals(values: dict[FieldRef, Value]) -> tuple:
+            def lookup(ref: FieldRef):
+                return values.get(self._var(ref), graph.UNKNOWN)
+            out = []
+            for k, m, delay, anchors in instances:
+                seen = tuple(values.get(ref, _UNSET) for ref in reads_of[k])
+                key = (k, m, seen)
+                found = memo.get(key)
+                if found is None:
+                    if anchors and any(values.get(self._var(self.schema.canonical(self.journey.activities[a].wait_field)),
+                                                  _UNSET) is _UNSET for a in anchors):
+                        found = ("pending", seen)     # the clock is not known yet: keep the values read so far
+                    elif all(v is not _UNSET for v in seen):
+                        found = self._predicate_truth(preds[k][0], lookup, values, delay, anchors)
+                    else:
+                        found = self._residual(preds[k][0], lookup, self.entry_time + timedelta(days=delay))
+                    memo[key] = found
+                out.append(found)
+            return tuple(out)
+
+        states: dict[tuple, _SubClass] = {residuals({}): _SubClass(values={}, groups={}, count=1, first=(),
+                                                                    best=self._preference({}))}
+        for ref, domain in zip(fields, (self.domains[f] for f in fields)):
+            merged: dict[tuple, tuple[_SubClass, tuple]] = {}
+            for state in states.values():
+                for i, value in enumerate(domain):
+                    values = {**state.values, ref: value}
+                    first = state.first + (i,)
+                    key = residuals(values)
+                    held = merged.get(key)
+                    candidate = (self._preference(values), first)
+                    if held is None:
+                        merged[key] = (_SubClass(values=values, groups={}, count=state.count, first=first,
+                                                 best=candidate[0]), first)
+                        continue
+                    sub, rep_index = held
+                    sub.count += state.count
+                    if first < sub.first:
+                        sub.first = first
+                    if candidate < (sub.best, rep_index):
+                        sub.values, sub.best = values, candidate[0]
+                        merged[key] = (sub, first)
+            if len(merged) > MAX_PREFIX_STATES:
+                return None
+            states = {key: sub for key, (sub, _) in merged.items()}
+        out: list[_SubClass] = []
+        for key, sub in states.items():
+            groups: dict[int, list[bool]] = {k: [] for k in pred_indexes}
+            for (k, _, _, _), truth in zip(instances, key):
+                groups[k].append(bool(truth))
+            sub.groups = {k: tuple(v) for k, v in groups.items()}
+            out.append(sub)
+        out.sort(key=lambda sub: sub.first)
+        return out
+
+    def _residual(self, formula: Formula, lookup, now: datetime, snapshot=None):
+        """A formula simplified with the values decided so far: True, False, or what is left of it (a condition,
+        or an operator with its remaining items), in a form equal for equal remainders. ``snapshot`` answers
+        Journey Data conditions when given (graph.evaluate)."""
+        if isinstance(formula, Condition):
+            try:
+                result = graph.evaluate(formula, lookup, self.schema, self.settings.case_insensitive_text, snapshot,
+                                        now=now)
+            except criteria.UnsupportedOperator:
+                return False
+            return formula if isinstance(result, graph.Unknown) else bool(result)
+        items = []
+        for item in formula.items:
+            result = self._residual(item, lookup, now, snapshot)
+            if result is True or result is False:
+                if (formula.operator == "AND") != result:
+                    return result          # a False item decides an AND, a True item decides an OR
+                continue
+            if result not in items:
+                items.append(result)
+        if not items:
+            return formula.operator == "AND"
+        return items[0] if len(items) == 1 else (formula.operator, tuple(items))
+
+    def _clocked_truths(self, index: int, formula: Formula, moments, lookup, values: dict[FieldRef, Value],
+                        reads: list[list[FieldRef]], memo: dict[tuple, tuple[bool, ...]]) -> tuple[bool, ...]:
+        """The truths of a predicate at each of its moments, memoised by the values of the fields it reads and of
+        its anchor waits (a field of an absent row reads null, as ``_mask_absent_rows`` has already written in
+        ``values``): the truth depends on nothing else."""
+        key = (index,) + tuple(values.get(ref) for ref in reads[index])
+        found = memo.get(key)
+        if found is None:
+            found = tuple(self._predicate_truth(formula, lookup, values, delay, anchors) for delay, anchors in moments)
+            memo[key] = found
+        return found
+
+    def _predicate_truth(self, formula: Formula, lookup, values: dict[FieldRef, Value], delay: float,
+                         anchors: tuple[str, ...]) -> bool:
+        """A predicate's truth for one contact-level combination at one moment (``_predicate_moments``)."""
+        now = self.entry_time + timedelta(days=delay)
+        for key in anchors:
+            wait = self.journey.activities[key]
+            moment = self.walker.read_date(values.get(self._var(self.schema.canonical(wait.wait_field))))
+            if moment is None:
+                continue
+            try:
+                now = max(now, graph.wait_end(wait, moment))
+            except criteria.UnsupportedOperator:
+                continue
+        try:
+            return bool(graph.evaluate(formula, lookup, self.schema, self.settings.case_insensitive_text, now=now))
+        except criteria.UnsupportedOperator:
+            return False
 
     def build_classes(self) -> None:
-        preds = self.contact_predicates()
-        domains = [self.domains[f] for f in self.contact_fields]
+        """Spec step 4: "a class groups the contact-level combinations that satisfy the same conditions".
+
+        The combinations are not listed as one cartesian product of every contact-level field: a journey with
+        many such fields has hundreds of millions of them. The fields are grouped into connected components by
+        "read by the same predicate" (aliases resolved; the fields of a table with the row present / row absent
+        variable go with its linked field, since an absent row empties them; a field no predicate reads is a
+        component of its own). Each predicate lies in exactly one component, so each component is enumerated on
+        its own (``_component_classes``) and the classes are the product of the components' classes: the values
+        are the union of their representatives, the truth vector the concatenation in predicate order, the member
+        count the product. This is the same partition as the full product: the preference is a sum over the
+        components and its lexicographic order is translation-invariant, so the best member of a product class is
+        the product of the best members; the first in product order of a product set is the product of the
+        firsts, so representatives and the order of the classes (first appearance) are the same as before.
+        """
+        preds = self._contact_predicate_points()
+        fields = self.contact_fields
+        position = {ref: i for i, ref in enumerate(fields)}
+        parent = list(range(len(fields)))
+
+        def find(i: int) -> int:
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+
+        def union(i: int, j: int) -> None:
+            a, b = find(i), find(j)
+            if a != b:
+                parent[max(a, b)] = min(a, b)
+
+        # A predicate evaluated at several moments depends only on the fields it reads and on the dates of its
+        # anchor waits: its truths are kept per combination of those values.
+        reads = [sorted({self._cond_var(c) for c in formula_conditions(p)}
+                        | {self._var(self.schema.canonical(self.journey.activities[key].wait_field))
+                           for _, anchors in moments for key in anchors}) for p, moments in preds]
+        for refs in reads:
+            indexes = [position[ref] for ref in refs if ref in position]
+            for i in indexes[1:]:
+                union(indexes[0], i)
+        for table, linked in self.row_fields.items():
+            if linked in position:
+                for ref in fields:
+                    if ref[0].lower() == table:
+                        union(position[linked], position[ref])
+        members: dict[int, list[int]] = {}
+        for i in range(len(fields)):
+            members.setdefault(find(i), []).append(i)
+        components = list(members.values())             # in order of their first field
+        owner: dict[int, int] = {}                       # predicate index -> component index (-1: reads no field)
+        for k, refs in enumerate(reads):
+            indexes = [position[ref] for ref in refs if ref in position]
+            owner[k] = components.index(members[find(indexes[0])]) if indexes else -1
+        if any(c == -1 for c in owner.values()):
+            components.append([])                        # predicates that read no contact-level field
+            for k in owner:
+                if owner[k] == -1:
+                    owner[k] = len(components) - 1
+        memo: dict[tuple, tuple[bool, ...]] = {}
+        per_component = [self._component_classes([fields[i] for i in comp],
+                                                 [k for k in range(len(preds)) if owner[k] == c], preds, reads, memo)
+                         for c, comp in enumerate(components)]
+
+        total = math.prod(len(found) for found in per_component)
+        combos = itertools.product(*per_component)
+        if total > MAX_CONTACT_CLASSES:
+            self.classes_incomplete = True
+            self.warnings.append(
+                f"{total} classi di contatti: ne sono state tenute solo {MAX_CONTACT_CLASSES}, quindi alcuni branch "
+                "raggiungibili possono risultare non coperti")
+            combos = itertools.islice(combos, MAX_CONTACT_CLASSES)
+        entries = []
+        for combo in combos:
+            first = [0] * len(fields)
+            for comp, sub in zip(components, combo):
+                for j, i in enumerate(comp):
+                    first[i] = sub.first[j]
+            entries.append((first, combo))
+        entries.sort(key=lambda entry: entry[0])
+        classes: list[ContactClass] = []
+        for number, (_, combo) in enumerate(entries, start=1):
+            merged: dict[FieldRef, Value] = {}
+            groups: dict[int, tuple[bool, ...]] = {}
+            count = 1
+            for sub in combo:
+                merged.update(sub.values)
+                groups.update(sub.groups)
+                count *= sub.count
+            truth = tuple(value for k in range(len(preds)) for value in groups.get(k, ()))
+            classes.append(ContactClass(id=number, values={ref: merged[ref] for ref in fields},
+                                        predicate_truth=truth, member_count=count))
+        self.classes = classes
+
+    def _component_classes(self, fields: list[FieldRef], pred_indexes: list[int], preds, reads,
+                           memo: dict[tuple, tuple[bool, ...]]) -> list["_SubClass"]:
+        """The classes of one component: the product of its fields' domains (at most MAX_CONTACT_COMBINATIONS,
+        with a warning), grouped by the truths of its predicates. Each keeps its member count, the index vector of
+        its first member in product order, and its representative: the best by ``_preference`` (spec: "prefers
+        those whose path rests on no unverified assumption"), the first in product order on a tie."""
+        domains = [self.domains[ref] for ref in fields]
         total = math.prod(len(d) for d in domains) if domains else 1
-        combos = itertools.product(*domains)
+        if total > MAX_CONTACT_COMBINATIONS and not any(ref[0].lower() in self.row_fields for ref in fields):
+            exact = self._component_classes_by_prefix(fields, pred_indexes, preds, reads)
+            if exact is not None:
+                return exact
+        combos = itertools.product(*[range(len(d)) for d in domains])
         if total > MAX_CONTACT_COMBINATIONS:
             self.classes_incomplete = True
             self.warnings.append(
                 f"{total} combinazioni di valori a livello di contatto: sono state esaminate solo le prime {MAX_CONTACT_COMBINATIONS}, "
                 "quindi mancano alcune classi di contatti e alcuni branch raggiungibili possono risultare non coperti")
             combos = itertools.islice(combos, MAX_CONTACT_COMBINATIONS)
-        by_truth: dict[tuple[bool, ...], ContactClass] = {}
-        best: dict[tuple[bool, ...], tuple[int, ...]] = {}
-        for combo in combos:
-            values = self._mask_absent_rows(dict(zip(self.contact_fields, combo)))
+        found: dict[tuple, _SubClass] = {}
+        for indexes in combos:
+            values = self._mask_absent_rows({ref: domain[i] for ref, domain, i in zip(fields, domains, indexes)})
 
             def lookup(ref: FieldRef, _values=values):
-                return _values.get(ref, graph.UNKNOWN)
+                return _values.get(self._var(ref), graph.UNKNOWN)
 
-            truth = tuple(bool(graph.evaluate(p, lookup, self.schema, self.settings.case_insensitive_text))
-                          for p in preds)
-            cls = by_truth.get(truth)
+            groups = {}
+            for k in pred_indexes:
+                formula, moments = preds[k]
+                groups[k] = self._clocked_truths(k, formula, moments, lookup, values, reads, memo) if moments else ()
+            key = tuple(groups[k] for k in pred_indexes)
+            sub = found.get(key)
             preference = self._preference(values)
-            if cls is None:
-                by_truth[truth] = ContactClass(id=len(by_truth) + 1, values=values, predicate_truth=truth, member_count=1)
-                best[truth] = preference
+            if sub is None:
+                found[key] = _SubClass(values=values, groups=groups, count=1, first=indexes, best=preference)
             else:
-                cls.member_count += 1
-                if preference < best[truth]:
+                sub.count += 1
+                if preference < sub.best:
                     # Spec: among values that cover the same branches, prefer those whose path rests on no
                     # unverified assumption. Every member of a class takes the same paths.
-                    cls.values = values
-                    best[truth] = preference
-        self.classes = list(by_truth.values())
+                    sub.values = values
+                    sub.best = preference
+        return list(found.values())
 
     def _mask_absent_rows(self, values: dict[FieldRef, Value]) -> dict[FieldRef, Value]:
         """Spec, "Row present or absent": every field of an absent row reads null, so a contact without the
@@ -711,13 +1557,16 @@ class CoverageEngine:
                         values[ref] = None
         return values
 
-    def _preference(self, values: dict[FieldRef, Value]) -> tuple[int, int, int]:
+    def _preference(self, values: dict[FieldRef, Value]) -> tuple[int, int, int, int]:
         """Spec, "Operators, types and values": "Among values that cover the same branches, the generator
         prefers those whose path rests on no unverified assumption: not null, row present." Lower is
-        better: the null values and absent rows, then the absent rows alone, then the values of a range
+        better: the null values and absent rows, then the absent rows alone, then (spec, step 3, "Validity
+        of the data": values are chosen so that the margin is at least the minimum validity "wherever a class
+        of values allows it") the values whose validity is below the setting, then the values of a range
         field that sit on a value named by a condition rather than strictly inside a range."""
         absent = {table for table, linked in self.row_fields.items() if linked in values and values[linked] is None}
         nulls = 0
+        short = 0
         on_points = 0
         for ref, value in values.items():
             if absent and ref[0].lower() in absent:
@@ -726,7 +1575,11 @@ class CoverageEngine:
                 nulls += 1
             elif value in self.named_points.get(ref, ()):
                 on_points += 1
-        return (nulls + len(absent), len(absent), on_points)
+            if self.validity:
+                days = self.validity.get(ref, {}).get(value)
+                if days is not None and days < self.settings.min_validity_days:
+                    short += 1
+        return (nulls + len(absent), len(absent), short, on_points)
 
     # -- symbolic exploration -----------------------------------------------------------
 
@@ -743,11 +1596,20 @@ class CoverageEngine:
             self.trees[cls.id] = self._explore_from(cls, state, {}, (), ())
 
     def _lookup(self, cls: ContactClass, assigned: dict[FieldRef, Value]):
+        alias_of = self.alias_of
+
         def lookup(ref: FieldRef):
             if ref in cls.values:
                 return cls.values[ref]
             if ref in assigned:
                 return assigned[ref]
+            source = alias_of.get(ref)
+            if source is not None:
+                # Spec, step 3: an entry copy reads the value of its source column (one variable).
+                if source in cls.values:
+                    return cls.values[source]
+                if source in assigned:
+                    return assigned[source]
             if ref in self.domains:
                 return graph.UNKNOWN
             # A field no split reads (only reachable through a tracked write): unknown.
@@ -771,7 +1633,7 @@ class CoverageEngine:
             self.reached_activities.add(state.current)
 
         if state.stop == graph.STOP_UNDETERMINED:
-            ref = state.pending_field
+            ref = self._var(state.pending_field) if state.pending_field is not None else None
             if ref is None or ref not in self.domains:
                 self.warnings.append(f"lo split '{state.current}' legge un campo di cui il generatore non sa elencare i valori: "
                                      "il percorso si ferma lì")
@@ -820,21 +1682,64 @@ class CoverageEngine:
             self.warnings.append(f"percorso interrotto: {state.stop_detail}")
         stop = state.stop or graph.STOP_EXIT
         # Spec, "Honest outcomes": past an element the walk cannot evaluate, the path is unknown from there on.
-        unknown_from = None if stop == graph.STOP_EXIT else (state.current or state.end_activity_key)
+        # Spec, step 3: a contact the exit criteria take out at the end of a wait has a known end there.
+        known = stop in (graph.STOP_EXIT, graph.STOP_EXIT_CRITERIA)
+        unknown_from = None if known else (state.current or state.end_activity_key)
         stopped = self.journey.activities.get(state.current or "")
         if stop == graph.STOP_UNSUPPORTED and stopped is not None and stopped.kind == KIND_UPDATE:
             self.stopped_at.setdefault(stopped.key, state.stop_detail)
+        exit_wait = state.exit_by_criteria if stop == graph.STOP_EXIT_CRITERIA else None
         leaf = Leaf(id=len(self.leaves), class_id=cls.id, assigned=dict(assigned), manual=manual, randoms=randoms,
                     steps=list(state.steps), emails_sent=list(state.emails_sent), writes=list(state.writes),
-                    waits=list(state.waits), stop=stop, stop_detail=state.stop_detail, unknown_from=unknown_from)
+                    waits=list(state.waits), stop=stop, stop_detail=state.stop_detail, unknown_from=unknown_from,
+                    timeline=state.timeline, sms_sent=state.sms_sent, exit_by_criteria=exit_wait)
         mask = 0
         for ref in state.branches():
             idx = self.branch_index.get(ref)
             if idx is not None:
                 mask |= 1 << idx
+        if self.active_exits:
+            for wait in state.waits:
+                if wait != exit_wait:
+                    self.passed_at[wait] = self.passed_at.get(wait, 0) + 1
+        if exit_wait is not None:
+            # Spec, step 3: "Every exit criterion is one extra coverage target": the bit of each criterion met.
+            self.exited_at[exit_wait] = self.exited_at.get(exit_wait, 0) + 1
+            for index in self._exits_met(cls, state, assigned):
+                exit_ = self.exits[index]
+                self.exit_met_at.setdefault(exit_wait, set()).add(exit_.key)
+                idx = self.branch_index.get((EXIT_PREFIX + exit_.key, EXIT_OUTCOME))
+                if idx is not None:
+                    mask |= 1 << idx
+            self.exit_states.append((cls, state, dict(assigned)))
         leaf.mask = mask
         self.leaves.append(leaf)
         return leaf
+
+    def _exits_met(self, cls: ContactClass, state: graph.WalkState, assigned: dict[FieldRef, Value]) -> list[int]:
+        """The indexes (in ``exits``) of the exit criteria a path that left by the exit criteria meets at the end of
+        its wait: the only one when there is one, else each re-evaluated with the clock at the wait's end and the
+        same data sources as the walker (Contact Data live, Journey Data from the snapshot)."""
+        if len(self.exits) == 1:
+            return [0]
+        lookup = self._lookup(cls, assigned)
+
+        def value(ref: FieldRef):
+            return self.walker.value_of(state, ref, lookup)
+
+        def snapshot(ref: FieldRef):
+            return self.walker.snapshot_of(ref, lookup)
+
+        met = []
+        for index, exit_ in enumerate(self.exits):
+            try:
+                result = graph.evaluate(exit_.formula, value, self.schema, self.settings.case_insensitive_text,
+                                        snapshot, now=state.clock)
+            except criteria.UnsupportedOperator:
+                continue
+            if result is True:
+                met.append(index)
+        return met
 
     # -- step 4 continued: every scenario-level combination ------------------------------
 
@@ -854,7 +1759,7 @@ class CoverageEngine:
                 sig = self._signature(assignment)
                 signatures.setdefault(sig, assignment)
             return signatures
-        preferences: dict[tuple[int, ...], tuple[int, int, int]] = {}
+        preferences: dict[tuple[int, ...], tuple[int, int, int, int]] = {}
         for combo in itertools.product(*domains):
             assignment = dict(zip(self.scenario_fields, combo))
             sig = self._signature(assignment)
@@ -878,6 +1783,7 @@ class CoverageEngine:
         Only deterministic leaves (no random split on the path) count here: the cover prefers
         paths that avoid random splits. Ties are broken by a fixed random seed."""
         rng = random.Random(self.settings.seed)
+        masks = self._effective_masks([leaf for leaf in self.leaves if leaf.deterministic])
         universe = 0
         for leaf in self.leaves:
             if leaf.deterministic:
@@ -888,7 +1794,7 @@ class CoverageEngine:
             for leaf_id in sig:
                 leaf = self.leaves[leaf_id]
                 if leaf.deterministic:
-                    mask |= leaf.mask
+                    mask |= masks[leaf.id]
             if mask:
                 candidates.append((sig, assignment, mask))
         rng.shuffle(candidates)
@@ -913,7 +1819,7 @@ class CoverageEngine:
         for i, (sig, _) in enumerate(chosen):
             for leaf_id in sig:
                 leaf = self.leaves[leaf_id]
-                if leaf.deterministic and leaf.mask:
+                if leaf.deterministic and masks[leaf.id]:
                     case_candidates.append((i, leaf))
         covered = 0
         selected: dict[int, list[Leaf]] = {}
@@ -925,7 +1831,7 @@ class CoverageEngine:
                 best = None
                 best_key = None
                 for cand in pool:
-                    gain = bin(cand[1].mask & ~covered).count("1")
+                    gain = bin(masks[cand[1].id] & ~covered).count("1")
                     if gain == 0:
                         continue
                     key = (-gain, cand[0], cand[1].class_id, cand[1].id)
@@ -946,6 +1852,31 @@ class CoverageEngine:
                     break
         scenarios = [(chosen[i][1], leaves) for i, leaves in sorted(selected.items())]
         return scenarios, universe
+
+    def _effective_masks(self, leaves: list[Leaf]) -> dict[int, int]:
+        """Leaf id -> the targets the cover may choose it for. Spec, step 3, "Validity of the data": values are
+        chosen so that the margin is at least the setting "minimum validity of the data" "wherever a class of values
+        allows it". A leaf whose contact or scenario values include one below the minimum validity counts only for
+        the targets that no leaf without such a value reaches (none: it is left out); the others count for all
+        theirs."""
+        if not self.validity:
+            return {leaf.id: leaf.mask for leaf in leaves}
+        short = {leaf.id: self._leaf_is_short(leaf) for leaf in leaves}
+        robust = 0
+        for leaf in leaves:
+            if not short[leaf.id]:
+                robust |= leaf.mask
+        return {leaf.id: leaf.mask & ~robust if short[leaf.id] else leaf.mask for leaf in leaves}
+
+    def _leaf_is_short(self, leaf: Leaf) -> bool:
+        """The leaf's class values or scenario values include a value valid for fewer days than the minimum."""
+        minimum = self.settings.min_validity_days
+        for values in (self.classes[leaf.class_id - 1].values, leaf.assigned):
+            for ref, value in values.items():
+                days = self.validity.get(ref, {}).get(value)
+                if days is not None and days < minimum:
+                    return True
+        return False
 
     def _preferred_per_mask(self, candidates: list) -> list:
         """Spec: "Among values that cover the same branches, the generator prefers those whose path rests on
@@ -983,6 +1914,7 @@ class CoverageEngine:
         random_universe &= ~det_universe
         if not random_universe:
             return []
+        masks = self._effective_masks([leaf for leaf in self.leaves if not leaf.deterministic])
         groups: list[tuple[dict[FieldRef, Value], int, tuple[ManualAction, ...], list[Leaf], int]] = []
         for sig, assignment in signatures.items():
             by_group: dict[tuple[int, tuple[ManualAction, ...]], list[Leaf]] = {}
@@ -993,7 +1925,7 @@ class CoverageEngine:
             for (class_id, manual), leaves in by_group.items():
                 mask = 0
                 for leaf in leaves:
-                    mask |= leaf.mask
+                    mask |= masks[leaf.id]
                 groups.append((assignment, class_id, manual, leaves, mask & random_universe))
         rng = random.Random(self.settings.seed + 1)
         rng.shuffle(groups)
@@ -1016,8 +1948,9 @@ class CoverageEngine:
             groups.remove(best)
         return chosen
 
-    def _random_info(self, leaves: list[Leaf]) -> tuple[list[Step], RandomInfo]:
-        """Cut the leaves at their first random split: the common prefix and one branch per leaf.
+    def _random_info(self, leaves: list[Leaf]) -> tuple[list[Step], RandomInfo, list[TimelinePoint]]:
+        """Cut the leaves at their first random split: the common prefix, one branch per leaf, and the timeline
+        of the prefix (spec, step 3).
 
         A leaf that crosses several random splits is one branch whose percentage is the product
         of the percentages it took; its steps show every random split crossed."""
@@ -1029,6 +1962,11 @@ class CoverageEngine:
                 break
             prefix.append(step)
         prefix.append(Step(first_key, None))
+        cut = len(prefix) - 1
+        # Spec, step 3: the timeline of the common part, the random split at the clock it is reached with.
+        timeline = list(leaves[0].timeline[:cut])
+        if len(leaves[0].timeline) > cut:
+            timeline.append(TimelinePoint(first_key, None, leaves[0].timeline[cut].at))
         order = {o.key: i for i, o in enumerate(activity.outcomes)}
 
         def sort_key(leaf: Leaf):
@@ -1046,22 +1984,29 @@ class CoverageEngine:
                 outcome_key=leaf.randoms[0][1], percentage=int(round(share * 100)),
                 steps=tuple(leaf.steps[idx + 1:]), emails_sent=tuple(leaf.emails_sent),
                 writes=tuple(leaf.writes), end_activity_key=leaf.end_activity_key,
-                unknown_from=leaf.unknown_from, unknown_reason=leaf.stop_detail if leaf.unknown_from else ""))
+                unknown_from=leaf.unknown_from, unknown_reason=leaf.stop_detail if leaf.unknown_from else "",
+                timeline=tuple(leaf.timeline[idx + 1:]), exit_by_criteria=leaf.exit_by_criteria))
         n = self.settings.contacts_per_random_case
         smallest = min((b.percentage for b in branches if b.percentage), default=0) / 100.0
         low, high = expected_range(n, smallest)
-        return prefix, RandomInfo(activity_key=first_key, branches=branches, expected_low=low, expected_high=high)
+        return prefix, RandomInfo(activity_key=first_key, branches=branches, expected_low=low,
+                                  expected_high=high), timeline
 
     # -- assembling scenarios, cases and statuses --------------------------------------
 
     def run(self) -> CoverageResult:
         self.branch_list = graph.split_branches(self.journey)
         self.branch_index = {(a.key, o.key): i for i, (a, o) in enumerate(self.branch_list)}
+        # Spec, step 3: one extra coverage target per evaluable exit criterion, after the split branches.
+        for i, exit_ in enumerate(self.exits):
+            self.branch_index[(EXIT_PREFIX + exit_.key, EXIT_OUTCOME)] = len(self.branch_list) + i
         self.warnings.extend(graph.structural_problems(self.journey))
+        self.warnings.extend(self.delay_warnings)
         self.collect_fields()
         self.build_domains()
         self.build_classes()
         self.explore()
+        self.warnings.extend(self._dead_wait_warnings())
         self.warnings.extend(self._same_name_different_conditions())
         self.warnings.extend(self._engagement_refers_to_an_earlier_email())
         signatures = self.enumerate_scenarios()
@@ -1095,8 +2040,11 @@ class CoverageEngine:
                 case = Case(id=f"{sid}-C{len(cases) + 1:02d}", scenario_id=sid, class_id=cls.id,
                             contact_values=dict(cls.values), steps=list(leaf.steps), emails_sent=list(leaf.emails_sent),
                             writes=list(leaf.writes), waits=list(leaf.waits), manual_actions=list(leaf.manual),
-                            end_activity_key=leaf.end_activity_key, contact_count=self.settings.contacts_per_case)
-                case.summary = self._summary(case.steps)
+                            end_activity_key=leaf.end_activity_key, contact_count=self.settings.contacts_per_case,
+                            timeline=list(leaf.timeline), exit_by_criteria=leaf.exit_by_criteria,
+                            sms_sent=list(leaf.sms_sent))
+                self.case_exits[case.id] = (self._exit_refs(leaf), [])
+                case.summary = self._summary(case.steps, case.exit_by_criteria)
                 if case.manual_actions:
                     case.inbox_blocked_reason = self._inbox_block_reason(cls.values, entry["values"])
                 if leaf.unknown_from is not None:
@@ -1104,7 +2052,7 @@ class CoverageEngine:
                 self._timing(case)
                 cases.append(case)
             for class_id, manual, leaves in sorted(entry["stat"], key=lambda g: (len(g[1]), g[0])):
-                prefix, info = self._random_info(leaves)
+                prefix, info, prefix_timeline = self._random_info(leaves)
                 cls = self.classes[class_id - 1]
                 prefix_keys = [st.activity_key for st in prefix]
                 case = Case(id=f"{sid}-C{len(cases) + 1:02d}", scenario_id=sid, class_id=cls.id,
@@ -1112,18 +2060,28 @@ class CoverageEngine:
                             emails_sent=[k for k in prefix_keys if self.journey.activities[k].kind == KIND_EMAIL],
                             writes=[], waits=[k for k in prefix_keys if self.journey.activities[k].kind in graph.WAIT_KINDS],
                             manual_actions=list(manual), end_activity_key=info.activity_key,
-                            contact_count=self.settings.contacts_per_random_case, random=info)
+                            contact_count=self.settings.contacts_per_random_case, random=info,
+                            timeline=prefix_timeline,
+                            sms_sent=[k for k in prefix_keys if self.journey.activities[k].kind == KIND_SMS])
+                self.case_exits[case.id] = ([], [ref for leaf in leaves for ref in self._exit_refs(leaf)])
                 prefix_summary = self._summary(case.steps)
                 case.summary = (prefix_summary + " > random split") if prefix_summary else "random split"
                 if case.manual_actions:
                     case.inbox_blocked_reason = self._inbox_block_reason(cls.values, entry["values"])
                 self._timing(case)
                 cases.append(case)
+            for case in cases:
+                case.validity_days = self._case_validity(case.contact_values, entry["values"])
             scenarios.append(Scenario(id=sid, key="", values=dict(entry["values"]), cases=cases, run_order=order,
                                       has_manual_action=any(c.manual_actions for c in cases),
                                       is_statistical=not entry["det"]))
 
-        branches = self._branch_statuses(scenarios)
+        buckets = self._case_buckets(scenarios)
+        branches = self._branch_statuses(scenarios, buckets)
+        exit_targets = self._exit_statuses(buckets)
+        perishable = self._perishable(scenarios)
+        self.warnings.extend(self._bound_notes(scenarios))
+        validities = [c.validity_days for s in scenarios for c in s.cases if c.validity_days is not None]
         stats = {
             "scenarios": len(scenarios),
             "cases": sum(len(s.cases) for s in scenarios),
@@ -1137,6 +2095,8 @@ class CoverageEngine:
             "exploration_truncated": int(self.exploration_truncated),
             "paths_explored": len(self.leaves),
             "scenario_signatures": len(signatures),
+            "exit_targets": len(exit_targets),
+            "exit_targets_covered": sum(1 for b in exit_targets if b.status != STATUS_NOT_COVERED),
         }
         return CoverageResult(
             scenarios=scenarios, branches=branches, classes=self.classes,
@@ -1147,7 +2107,98 @@ class CoverageEngine:
             + [key for key in self.stopped_at if key.partition("/")[0] in self.journey.activities],
             warnings=list(dict.fromkeys(self.warnings)), stats=stats,
             row_fields={linked[0]: linked for linked in self.row_fields.values()},
-            unsupported_reasons=dict(self.stopped_at))
+            unsupported_reasons=dict(self.stopped_at),
+            exit_targets=exit_targets, validity_days=min(validities) if validities else None,
+            perishable=perishable)
+
+    # -- validity of the data (spec, step 3) ----------------------------------------------
+
+    def _case_validity(self, contact_values: dict[FieldRef, Value],
+                       scenario_values: dict[FieldRef, Value]) -> Optional[int]:
+        """Spec, step 3, "Validity of the data": the earliest validity of the values of a case's rows (its
+        contact values and its scenario values) that have one; None when none is perishable ("A case whose values
+        are all not perishable has no validity ... and sets no deadline")."""
+        found = [days for values in (contact_values, scenario_values) for ref, value in values.items()
+                 for days in [self.validity.get(ref, {}).get(value)] if days is not None]
+        return min(found) if found else None
+
+    def _perishable(self, scenarios: list[Scenario]) -> list[str]:
+        """One sentence per perishable value that the cases use, in field order, then in domain order: how long it
+        stays valid and which condition reads it differently after that. A value below the minimum validity of
+        the data is reported too (spec: "a value with a smaller margin is reported")."""
+        used: set[tuple[FieldRef, Value]] = set()
+        for scenario in scenarios:
+            for case in scenario.cases:
+                used.update(case.contact_values.items())
+            used.update(scenario.values.items())
+        out: list[str] = []
+        for ref in self.fields:
+            for value in self.domains.get(ref, []):
+                days = self.validity.get(ref, {}).get(value)
+                if days is None or (ref, value) not in used:
+                    continue
+                change = self.validity_change.get(ref, {}).get(value)
+                then = f", poi {self._point_text(change)} lo legge diversamente" if change is not None else ""
+                out.append(f"{ref[0]}.{ref[1]} = {value}: resta valido {days} {'giorno' if days == 1 else 'giorni'} "
+                           f"dall'ora di ingresso{then}")
+                if days < self.settings.min_validity_days:
+                    self.warnings.append(
+                        f"{ref[0]}.{ref[1]} = {value} resta valido solo {days} {'giorno' if days == 1 else 'giorni'} "
+                        f"dall'ora di ingresso, meno della validità minima dei dati impostata "
+                        f"({self.settings.min_validity_days} {'giorno' if self.settings.min_validity_days == 1 else 'giorni'}): "
+                        "nessun valore che porta il contatto sugli stessi branch ha un margine più ampio")
+        return out
+
+    def _bound_notes(self, scenarios: list[Scenario]) -> list[str]:
+        """Spec, step 3: "Some classes compare on a bound at the split whatever their value ... The branch is still
+        covered, by a value of that class chosen with the rules above, and the testbook and the report say that the
+        branch is decided on the bound of a day-level comparison." One note per branch and condition: a day-level relative
+        condition evaluated on the path of a case (the outcomes tried up to the one taken) whose date equals the
+        reference date at the clock the timeline gives."""
+        found: dict[tuple[str, str, str, FieldRef, Value], list[str]] = {}
+        for scenario in scenarios:
+            for case in scenario.cases:
+                values = {**scenario.values, **case.contact_values}
+                points = list(case.timeline)
+                if case.random is not None:
+                    for branch in case.random.branches:
+                        points.extend(branch.timeline)
+                for point in points:
+                    activity = self.journey.activities.get(point.activity_key)
+                    if activity is None or activity.kind != KIND_DECISION or point.outcome_key is None:
+                        continue
+                    remainder = [o for o in activity.outcomes if o.is_remainder or o.formula is None]
+                    for outcome in [o for o in activity.outcomes if o not in remainder] + remainder:
+                        for cond in formula_conditions(outcome.formula):
+                            if cond.relative is None:
+                                continue
+                            ref = self._cond_var(cond)
+                            moment = self.walker.read_date(values.get(ref))
+                            try:
+                                if moment is None or not criteria.is_day_level(cond.relative):
+                                    continue
+                                reference = criteria.shift_date(point.at, cond.relative)
+                            except criteria.UnsupportedOperator:
+                                continue
+                            if moment.date() == reference.date():
+                                key = (activity.key, point.outcome_key, formula_text(cond), ref, values.get(ref))
+                                ids = found.setdefault(key, [])
+                                if case.id not in ids:
+                                    ids.append(case.id)
+                        if outcome.key == point.outcome_key:
+                            break
+        notes: list[str] = []
+        for (split, outcome_key, text, ref, value), ids in found.items():
+            activity = self.journey.activities[split]
+            outcome = activity.outcome(outcome_key)
+            label = label_of(outcome) if outcome is not None else outcome_key
+            name = activity.name or split
+            cases = ids[0] if len(ids) == 1 else ", ".join(ids)
+            notes.append(f"il branch '{label}' dello split '{name}' ({split}) è percorso {'dal caso' if len(ids) == 1 else 'dai casi'} "
+                         f"{cases}, in cui {ref[0]}.{ref[1]} = {value} cade esattamente sull'estremo della condizione "
+                         f"{text} quando il contatto arriva allo split: il branch è deciso sull'estremo di un "
+                         "confronto sul giorno (si confronta la parte data del campo con la data dell'orologio)")
+        return notes
 
     # -- honest outcomes: windows of the manual actions and minimum durations -------------
 
@@ -1218,7 +2269,7 @@ class CoverageEngine:
                             "quindi l'email non può essere aperta né cliccata")
         return None
 
-    def _summary(self, steps: list[Step]) -> str:
+    def _summary(self, steps: list[Step], exit_wait: Optional[str] = None) -> str:
         parts: list[str] = []
         for step in steps:
             activity = self.journey.activities.get(step.activity_key)
@@ -1228,6 +2279,11 @@ class CoverageEngine:
                 outcome = activity.outcome(step.outcome_key)
                 label = outcome.label if outcome is not None and outcome.label else "condizione vera"
                 parts.append(f"{activity.name or activity.key}: {label}")
+        if exit_wait is not None:
+            # Spec, step 3: "leaves the journey at the end of <wait>, because the exit criteria are met".
+            wait = self.journey.activities.get(exit_wait)
+            parts.append(f"esce alla fine di '{(wait.name if wait is not None and wait.name else exit_wait)}' "
+                         "per i criteri di uscita")
         text = " > ".join(parts)
         return text if len(text) <= 160 else text[:157] + "..."
 
@@ -1281,10 +2337,10 @@ class CoverageEngine:
                 out.append(f"pattern sospetto: {len(variants)} split con condizioni diverse hanno lo stesso nome '{name}' ({keys})")
         return out
 
-    def _branch_statuses(self, scenarios: list[Scenario]) -> list[BranchStatus]:
-        """Each split branch: covered (a case without manual action crosses it), covered with
-        manual action, or not covered with a reason. A branch crossed only after a random split
-        is flagged statistical; the branches before the random split are crossed with certainty."""
+    def _case_buckets(self, scenarios: list[Scenario]):
+        """The branches each case crosses, by kind of case: plainly, with a manual action, only after a random split
+        (with or without a manual action), or in a case whose manual action cannot be done. The exit criteria met
+        by a case count as branches (spec, step 3: "Every exit criterion is one extra coverage target")."""
         plain: dict[BranchRef, list[str]] = {}
         manual: dict[BranchRef, list[str]] = {}
         stat_plain: dict[BranchRef, list[str]] = {}
@@ -1292,21 +2348,24 @@ class CoverageEngine:
         blocked: dict[BranchRef, list[tuple[str, str]]] = {}   # manual cases whose action cannot be done
         for scenario in scenarios:
             for case in scenario.cases:
+                exits_before, exits_after = self.case_exits.get(case.id, ([], []))
                 if case.manual_actions and case.inbox_blocked_reason:
                     refs = [(s.activity_key, s.outcome_key) for s in case.steps if s.outcome_key is not None]
                     if case.random is not None:
                         for rb in case.random.branches:
                             refs.append((case.random.activity_key, rb.outcome_key))
                             refs.extend((s.activity_key, s.outcome_key) for s in rb.steps if s.outcome_key is not None)
-                    for ref in refs:
+                    for ref in refs + exits_before + exits_after:
                         blocked.setdefault(ref, []).append((case.id, case.inbox_blocked_reason))
                     continue
                 before = [(s.activity_key, s.outcome_key) for s in case.steps if s.outcome_key is not None]
+                before.extend(exits_before)
                 after: list[BranchRef] = []
                 if case.random is not None:
                     for rb in case.random.branches:
                         after.append((case.random.activity_key, rb.outcome_key))
                         after.extend((s.activity_key, s.outcome_key) for s in rb.steps if s.outcome_key is not None)
+                after.extend(exits_after)
                 sure = manual if case.manual_actions else plain
                 random_bucket = stat_manual if case.manual_actions else stat_plain
                 for ref in before:
@@ -1322,7 +2381,13 @@ class CoverageEngine:
                 statistical.setdefault(ref, []).extend(ids)
             else:
                 statistical.setdefault(ref, []).extend(ids)
+        return plain, manual, statistical, blocked
 
+    def _branch_statuses(self, scenarios: list[Scenario], buckets=None) -> list[BranchStatus]:
+        """Each split branch: covered (a case without manual action crosses it), covered with
+        manual action, or not covered with a reason. A branch crossed only after a random split
+        is flagged statistical; the branches before the random split are crossed with certainty."""
+        plain, manual, statistical, blocked = buckets if buckets is not None else self._case_buckets(scenarios)
         unsupported = set(self.package.unsupported_activities)
         preds = graph.predecessors(self.journey)
         statuses: list[BranchStatus] = []
@@ -1381,13 +2446,193 @@ class CoverageEngine:
                                   if root_reason.startswith(("attività non supportata", "branch non supportato",
                                                              "a valle di un elemento non supportato"))
                                   else "non raggiungibile")
-                        reason = (f"{prefix}: si trova a valle del branch '{root_activity.name or behind[0]}: {label_of(root_outcome)}' "
+                        # A wait at whose end the exit criteria take everyone out has no label of its own (spec, step 3).
+                        root_label = ("fine del wait" if root_activity.kind in graph.WAIT_KINDS
+                                      else label_of(root_outcome))
+                        reason = (f"{prefix}: si trova a valle del branch '{root_activity.name or behind[0]}: {root_label}' "
                                   f"({behind[0]}), che non è coperto per questo motivo: {root_reason}")
                     else:
                         reason = self._not_covered_reason(activity, outcome, preds)
                 statuses.append(BranchStatus(activity.key, activity.name, activity.kind, outcome.key, label,
                                              STATUS_NOT_COVERED, reason, [], behind=behind))
         return statuses
+
+    # -- exit criteria (spec, step 3, "Exit criteria and goals") ---------------------------
+
+    def _exit_refs(self, leaf: Leaf) -> list[BranchRef]:
+        """The exit-criteria targets a leaf's mask holds: ``(EXIT_PREFIX + key, EXIT_OUTCOME)`` per criterion met."""
+        out = []
+        for exit_ in self.exits:
+            ref = (EXIT_PREFIX + exit_.key, EXIT_OUTCOME)
+            idx = self.branch_index.get(ref)
+            if idx is not None and leaf.mask >> idx & 1:
+                out.append(ref)
+        return out
+
+    def _exit_statuses(self, buckets) -> list[BranchStatus]:
+        """Spec, step 3: "Every exit criterion is one extra coverage target, "exit criteria met at the end of a
+        wait", so that the cover includes at least one case that leaves the journey this way when it is
+        reachable; the summary counts it apart from the branches of the splits." One BranchStatus per evaluable
+        criterion, with the same states as a branch."""
+        plain, manual, statistical, blocked = buckets
+        stat_note = f"raggiunto solo attraverso un random split; caso statistico di {self.settings.contacts_per_random_case} contatti"
+        out: list[BranchStatus] = []
+        for exit_ in self.exits:
+            ref = (EXIT_PREFIX + exit_.key, EXIT_OUTCOME)
+            head = (exit_.key, _exit_description(exit_) or exit_.name, EXIT_KIND, EXIT_OUTCOME, EXIT_LABEL)
+            if ref in plain:
+                out.append(BranchStatus(*head, STATUS_COVERED, "", sorted(set(plain[ref]))))
+            elif ref in manual:
+                is_stat = ref in statistical
+                reason = "un contatto deve aprire o cliccare l'email" + ("; " + stat_note if is_stat else "")
+                if self.settings.real_inbox:
+                    out.append(BranchStatus(*head, STATUS_MANUAL, reason, sorted(set(manual[ref])), statistical=is_stat))
+                else:
+                    out.append(BranchStatus(*head, STATUS_NOT_COVERED,
+                                            "richiede un open o un click, ma non è configurata un'inbox reale; i casi "
+                                            "esistono, con indirizzi non recapitabili",
+                                            sorted(set(manual[ref])), statistical=is_stat))
+            elif ref in statistical:
+                out.append(BranchStatus(*head, STATUS_COVERED, stat_note, sorted(set(statistical[ref])), statistical=True))
+            elif ref in blocked:
+                out.append(BranchStatus(*head, STATUS_NOT_COVERED,
+                                        f"richiede un open o un click che non si può fare: {blocked[ref][0][1]}; i casi esistono",
+                                        sorted({cid for cid, _ in blocked[ref]})))
+            else:
+                out.append(BranchStatus(*head, STATUS_NOT_COVERED, self._exit_not_covered_reason(exit_), []))
+        return out
+
+    def _exit_not_covered_reason(self, exit_: JourneyFilter) -> str:
+        waits = [a.key for a in self.journey.activities.values() if a.kind in graph.WAIT_KINDS]
+        if not waits or not self.waits_reached_by_paths:
+            return ("non raggiungibile: nessun percorso del journey passa per un wait, e i criteri di uscita sono "
+                    "valutati solo alla fine di un wait")
+        if not any(key in self.reached_activities for key in waits):
+            return ("non raggiungibile: nessun percorso simulato raggiunge un wait, quindi i criteri di uscita non "
+                    "vengono mai valutati")
+        return (f"non raggiungibile: nessun contatto che arriva alla fine di un wait soddisfa i criteri di uscita "
+                f"({_exit_description(exit_)})")
+
+    def _dead_wait(self, key: str) -> bool:
+        """Every explored path that reaches the end of this wait leaves the journey there by the exit criteria."""
+        return self.exited_at.get(key, 0) > 0 and self.passed_at.get(key, 0) == 0
+
+    def _exits_text(self, wait_keys) -> str:
+        """The descriptions of the exit criteria met at the end of these waits (all of them when none is known)."""
+        met = set().union(*(self.exit_met_at.get(k, set()) for k in wait_keys)) if wait_keys else set()
+        exits = [e for e in self.exits if e.key in met] or self.exits
+        return " oppure ".join(_exit_description(e) for e in exits)
+
+    def _wait_label(self, key: str) -> str:
+        activity = self.journey.activities.get(key)
+        name = activity.name if activity is not None and activity.name else ""
+        return f"'{name}' ({key})" if name and name != key else f"'{key}'"
+
+    def _dead_wait_reason(self, key: str) -> str:
+        return (f"non raggiungibile: tutti i contatti che arrivano alla fine del wait {self._wait_label(key)} escono dal "
+                f"journey per i criteri di uscita ({self._exits_text([key])})")
+
+    def _dead_wait_warnings(self) -> list[str]:
+        """Spec, step 3: "the report must say that every branch behind the first wait is unreachable for this
+        reason, as a finding on the journey". One warning per wait at whose end every explored path leaves by the
+        exit criteria, when something comes after it."""
+        out = []
+        for activity in self.journey.activities.values():
+            if activity.kind not in graph.WAIT_KINDS or not self._dead_wait(activity.key):
+                continue
+            if not any(o.next for o in activity.outcomes):
+                continue
+            out.append(f"rilievo sul journey: tutti i contatti che arrivano alla fine del wait "
+                       f"{self._wait_label(activity.key)} soddisfano i criteri di uscita ({self._exits_text([activity.key])}) "
+                       "ed escono dal journey, quindi nessuno raggiunge le attività che seguono il wait e ogni branch a "
+                       "valle è non raggiungibile: probabile errore di configurazione del journey, da segnalare al cliente "
+                       "(decisione del team del 14 ottobre 2026)")
+        return out
+
+    def _exit_shadow(self) -> dict[BranchRef, set[str]]:
+        """Branch -> the waits at whose end the contacts that would cross it leave by the exit criteria.
+
+        Spec, step 3: "A branch no contact can reach because every contact that gets to the wait before it meets
+        the exit criteria is reported as unreachable with that reason." Every explored path that left by the exit
+        criteria is walked on from the end of its wait as if the exit criteria were false (a walker on the journey
+        without exit criteria), branching on undecided values and on engagement and random splits as the
+        exploration does; the branches those walks cross are recorded with the wait. Computed once, on demand, up
+        to MAX_SHADOW_PATHS walks (a warning says when the limit is reached)."""
+        if self._shadow is not None:
+            return self._shadow
+        self._shadow = {}
+        if not self.exit_states:
+            return self._shadow
+        journey = dataclasses.replace(self.journey, exits=[])
+        walker = graph.Walker(journey, self.schema, self.package.emails, self.settings.case_insensitive_text,
+                              self.now, self.settings.date_format, row_fields=self.row_fields,
+                              entry_time=self.entry_time, ends_at_once_when_unknown=self._wait_ends_at_once)
+        walked = 0
+        for cls, state, assigned in self.exit_states:
+            wait_key = state.exit_by_criteria
+            wait = journey.activities.get(wait_key or "")
+            if wait is None:
+                continue
+            start = state.clone()
+            start.steps.pop()
+            start.timeline.pop()
+            start.exit_by_criteria = None
+            walker.take(start, wait, wait.outcomes[0] if wait.outcomes else None)
+            stack = [(start, dict(assigned))]
+            while stack:
+                if walked >= MAX_SHADOW_PATHS:
+                    self.warnings.append(
+                        f"più di {MAX_SHADOW_PATHS} percorsi da seguire oltre i criteri di uscita: per alcuni branch non "
+                        "raggiunti il motivo può non citare i criteri di uscita")
+                    return self._shadow
+                current, values = stack.pop()
+                walker.run(current, self._lookup(cls, values))
+                if current.stop == graph.STOP_UNDETERMINED and current.pending_field is not None \
+                        and self._var(current.pending_field) in self.domains:
+                    ref = self._var(current.pending_field)
+                    for value in reversed(self.domains[ref]):
+                        child = current.clone()
+                        stack.append((child, {**values, ref: value}))
+                    continue
+                if current.stop == graph.STOP_CHOICE and current.current in journey.activities:
+                    activity = journey.activities[current.current]
+                    verdict = (graph.engagement_verdict(activity, current, self.package.emails, journey)
+                               if activity.kind == KIND_ENGAGEMENT else None)
+                    for outcome in reversed(activity.outcomes):
+                        if verdict is not None and outcome.when is True and not verdict.possible:
+                            continue
+                        child = current.clone()
+                        walker.take(child, activity, outcome)
+                        stack.append((child, values))
+                    continue
+                walked += 1
+                for ref in current.branches():
+                    self._shadow.setdefault(ref, set()).add(wait_key)
+        return self._shadow
+
+    def _exit_reason(self, activity: Activity, outcome: Outcome) -> Optional[str]:
+        """Why a branch is not covered when the exit criteria are the cause, else None.
+
+        A wait at whose end every explored path leaves (``_dead_wait``): "tutti i contatti che arrivano alla fine
+        del wait ... escono dal journey per i criteri di uscita"; the activities behind it inherit the reason
+        through the root-cause computation. A branch the walks past the exit criteria cross (``_exit_shadow``):
+        the contacts that would take it leave earlier, at the end of the waits named."""
+        key = activity.key
+        if not self.exit_states:
+            return None
+        if activity.kind in graph.WAIT_KINDS and self._dead_wait(key):
+            return self._dead_wait_reason(key)
+        waits = self._exit_shadow().get((key, outcome.key))
+        if not waits:
+            return None
+        ordered = [k for k in self.journey.activities if k in waits]
+        dead = [k for k in ordered if self._dead_wait(k)]
+        if dead and key not in self.reached_activities:
+            return self._dead_wait_reason(dead[0])
+        shown = ", ".join(self._wait_label(k) for k in ordered)
+        reached = "lo split è raggiunto, ma " if key in self.reached_activities else ""
+        return (f"non raggiungibile: {reached}i contatti che prenderebbero questo branch escono prima dal journey alla "
+                f"fine del wait {shown}, perché soddisfano i criteri di uscita ({self._exits_text(ordered)})")
 
     def _seen_text(self, ref: FieldRef, values: set[Value]) -> str:
         """The values a split saw in a field, for the reason of a branch that never matched."""
@@ -1452,6 +2697,9 @@ class CoverageEngine:
         blocked = self.engagement_blocked.get((key, outcome.key))
         if blocked:
             return "non raggiungibile: " + blocked
+        exit_reason = self._exit_reason(activity, outcome)
+        if exit_reason is not None:
+            return exit_reason
         if key not in self.reached_activities:
             parent = sorted(preds.get(key, ()))
             if not parent:
@@ -1464,7 +2712,8 @@ class CoverageEngine:
             for cond in formula_conditions(outcome.formula):
                 ref = self.schema.canonical((cond.table, cond.field))
                 ftype = self.schema.field_type(ref)
-                if cond.operator in RANGE_OPERATORS and ftype not in RANGE_TYPES and cond.value_attribute is None:
+                if (cond.operator in RANGE_OPERATORS and ftype not in RANGE_TYPES and cond.value_attribute is None
+                        and cond.relative is None):
                     # build_domain picks no value inside a range of such a field, so the branch may well be
                     # reachable in Salesforce: an element the generator does not support, not an unreachable branch.
                     why = (f"la condizione confronta {ref[0]}.{ref[1]}, un campo di tipo {ftype}, con {cond.operator}: il "
@@ -1503,6 +2752,11 @@ def _unknown_engagement(activity: Activity) -> bool:
 
 def label_of(outcome: Outcome) -> str:
     return outcome.label or outcome.key
+
+
+def _exit_description(exit_: JourneyFilter) -> str:
+    """An exit criterion in plain words: its description, else its formula."""
+    return " ".join((exit_.description or "").split()) or formula_text(exit_.formula)
 
 
 def expected_range(n: int, p: float) -> tuple[int, int]:

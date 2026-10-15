@@ -1,0 +1,103 @@
+{
+  "journey_name": "EX_ExitCriteriaRemovesEveryone",
+  "activity_count": 7,
+  "csv_tables": [
+    "DE_Entry",
+    "DE_Master"
+  ],
+  "table_levels": {
+    "DE_Entry": "contact",
+    "DE_Master": "contact"
+  },
+  "branches": {
+    "SPLIT-1/path_a": {
+      "status": "covered"
+    },
+    "SPLIT-1/remainder_path": {
+      "status": "covered"
+    },
+    "SPLIT-2/path_a": {
+      "status": "not covered",
+      "reason_contains": [
+        "criteri di uscita",
+        "criterio di uscita",
+        "exit criteria"
+      ]
+    },
+    "SPLIT-2/remainder_path": {
+      "status": "not covered",
+      "reason_contains": [
+        "criteri di uscita",
+        "criterio di uscita",
+        "exit criteria"
+      ]
+    }
+  },
+  "exit_targets": {
+    "EXITCRITERIA/met": {
+      "status": "covered"
+    }
+  },
+  "scenario_count": {
+    "min": 1,
+    "max": 1
+  },
+  "case_count": {
+    "min": 2,
+    "max": 2
+  },
+  "contact_count": 6,
+  "cases": [
+    {
+      "contact_constraints": {
+        "DE_Master.EndDate": {
+          "not_null": true
+        }
+      },
+      "end_activity": "WAIT-1",
+      "manual_actions": [],
+      "emails_sent": [],
+      "contact_count": 3,
+      "exit_by_criteria": "WAIT-1",
+      "timeline": {
+        "SPLIT-1": "2026-10-11 12:00",
+        "WAIT-1": "2026-10-13 12:00"
+      }
+    },
+    {
+      "contact_values": {
+        "DE_Master.EndDate": null
+      },
+      "end_activity": "UPDATE-3",
+      "manual_actions": [],
+      "emails_sent": [],
+      "contact_count": 3,
+      "exit_by_criteria": null,
+      "timeline": {
+        "SPLIT-1": "2026-10-11 12:00"
+      }
+    }
+  ],
+  "validity_days": null,
+  "unsupported": [],
+  "report_contains": [
+    [
+      "criteri di uscita",
+      "criterio di uscita",
+      "exit criteria"
+    ],
+    [
+      "WAIT-1",
+      "2 days"
+    ]
+  ],
+  "testbook_contains": [
+    [
+      "criteri di uscita",
+      "criterio di uscita",
+      "exit criteria"
+    ]
+  ],
+  "csv_no_space_cells": true,
+  "checks_pass": true
+}

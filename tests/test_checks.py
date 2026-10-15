@@ -7,17 +7,19 @@ The extensions beyond the pilot (rows present or absent, entries no query fills)
 
 from __future__ import annotations
 
+import copy
 import csv
 import io
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from cjhelper import checks, coverage, datagen, outputs, pipeline
-from cjhelper.model import ENTRY_AUTOMATION, ENTRY_RUN_ONCE, ENTRY_SCHEDULED, LEVEL_CONTACT, Settings
+from cjhelper.model import (ENTRY_AUTOMATION, ENTRY_RUN_ONCE, ENTRY_SCHEDULED, LEVEL_CONTACT, Field, Settings,
+                            Step)
 from tests.helpers import cond, decision, field, journey, package, table, table_model, update
 
 EXAMPLE = Path(__file__).resolve().parent.parent / "examples" / "two_levels" / "package.json"
@@ -283,3 +285,80 @@ def test_entry_check_does_not_apply_without_an_entry_query(kind, words):
     assert entry_check.passed and entry_check.details == [
         f"{checks.NOT_APPLICABLE}: l'entry source di questo journey è {words}, che nessuna query popola, quindi le "
         "righe di ingresso sono quelle di DE_Entry.csv e non c'è una entry query con cui confrontarle"]
+
+
+# ---------------------------------------------------------------------------
+# Spec, step 3, "Honest checks": the clock, date offsets, what the entry check cannot verify
+# ---------------------------------------------------------------------------
+
+EXAMPLES = Path(__file__).resolve().parent.parent / "examples"
+NOW = datetime(2026, 10, 11, 12, 0)
+
+
+def example_world(name, **settings):
+    return pipeline.generate(str(EXAMPLES / name / "package.json"), Settings(generation_time=NOW, **settings),
+                             with_testbook=False)
+
+
+def test_simulation_runs_with_the_entry_time_and_the_exit_criteria_of_the_coverage():
+    world = example_world("relative_date_after_today", entry_time=NOW + timedelta(days=3))
+    assert all(c.passed for c in run(world)), [(c.name, c.details) for c in run(world) if not c.passed]
+    # The relative dates read differently on another clock, so the paths of the coverage are not followed.
+    other_clock = checks.run_checks(world.package, world.table_model, world.coverage, world.data, dict(world.files),
+                                    replace(world.settings, entry_time=None), world.generation_time)
+    assert "segue il percorso" in failed(other_clock, SIMULATION)
+    world = example_world("exit_criteria_at_wait_end")
+    [leaving] = [c for c in world.coverage.cases if c.exit_by_criteria]
+    assert leaving.steps[-1] == Step(leaving.exit_by_criteria, None)
+    assert all(c.passed for c in run(world)), [(c.name, c.details) for c in run(world) if not c.passed]
+
+
+def test_entry_check_verifies_the_date_part_of_a_date_offset_filter():
+    world = example_world("date_offset_filter")      # DE_Member.CreatedDate is yesterday's date
+    assert run(world)[ENTRY].passed
+    same_day = edit(world, "DE_Member", set_value("ContactId", C1, "CreatedDate", "2026-10-10 03:15"))
+    assert run(world, same_day)[ENTRY].passed
+    other_day = edit(world, "DE_Member", set_value("ContactId", C1, "CreatedDate", "2026-10-09 12:00"))
+    assert C1 in failed(run(world, other_day), ENTRY)
+
+
+def test_entry_check_reports_what_it_cannot_verify_and_fails_only_on_the_rest():
+    world = example_world("case_when_identifier")
+    entry = run(world)[ENTRY]
+    assert entry.passed
+    assert any(d.startswith("non verificato: DE_Entry.Email_Identifier è calcolata da un'espressione non compresa (CASE WHEN")
+               for d in entry.details)
+    assert "non verificato: DE_Backup è unita con LEFT JOIN, letta come inner join" in entry.details
+    broken = edit(world, "DE_Entry", set_value("ContactId", C1, "Emailaddress", "someone@else.example"))
+    assert "Emailaddress" in failed(run(world, broken), ENTRY)
+
+
+def test_a_column_computed_by_an_expression_not_understood_is_not_verified_even_when_no_split_reads_it():
+    """Spec, step 3, "Honest checks": a column the check cannot verify is "not verified", whether a split reads it
+    or not (RET_99_4W: Service_Call_Identifier, computed by a CASE and read by no split, holds a placeholder)."""
+    world = example_world("case_when_identifier")
+    unread = replace(world.coverage, contact_fields=[ref for ref in world.coverage.contact_fields
+                                                     if ref != ("DE_Entry", "Email_Identifier")])
+    placeholder = edit(world, "DE_Entry", set_value("ContactId", C1, "Email_Identifier", "TST_Email_Identifier_1"))
+    entry = run(world, placeholder, coverage=unread)[ENTRY]
+    assert entry.passed, entry.details
+    assert any(d.startswith("non verificato: DE_Entry.Email_Identifier è calcolata da un'espressione non compresa")
+               for d in entry.details)
+    assert not any("non lo popola" in d for d in entry.details)
+
+
+@pytest.mark.parametrize("default, value, passes", [
+    ("GetDate()", "2026-01-31 08:15", True),     # any date: the column holds what the table fills when inserting
+    ("GetDate()", "not a date", False),
+    (None, "2026-01-31 08:15", False),           # no such default: the query leaves the column empty
+])
+def test_entry_column_the_query_does_not_fill_accepts_any_date_when_it_defaults_to_the_current_date(default, value, passes):
+    world = example_world("date_offset_filter")
+    package = copy.deepcopy(world.package)
+    package.tables["DE_Entry"].fields.append(Field("Loaded", "Date", None, False, True, default, 99))
+    header, rows = checks.read_csv_bytes(world.files["DE_Entry.csv"])
+    lines = [",".join(header + ["Loaded"])] + [",".join(row[h] or "" for h in header) + f",{value}" for row in rows]
+    files = dict(world.files, **{"DE_Entry.csv": "\r\n".join(lines).encode("utf-8")})
+    results = checks.run_checks(package, world.table_model, world.coverage, world.data, files, world.settings,
+                                world.generation_time)
+    assert results[ENTRY].passed is passes

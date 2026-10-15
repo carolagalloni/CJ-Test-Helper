@@ -379,3 +379,187 @@ The CSVs are still imported by hand. The procedure depends on the entry source, 
 
 - On the pilot, every CSV and `scenarios.csv` stay byte-identical to the outputs before these extensions (same time, run identifier and seed); differences in report.md and the testbook are listed for the team.
 - The four further exports run without errors, and each construct above has a synthetic example in `examples/` with hand-derived expected answers.
+
+## Extensions for time-dependent journeys (step 3, 14 October 2026)
+
+Six further exports of one retention family (two weeks, four weeks, six weeks, three months, five days and
+hot churn before a contract end date) use constructs that neither the pilot nor the step 2 exports had. They
+are client exports and stay outside the repository. The rules below extend the spec; where they differ from an
+earlier section, they win. Facts marked "documented" were read in the Salesforce documentation on 14 October
+2026; everything else marked "assumption" stays visible in the report until a real run confirms it.
+
+### The clock: a contact's path depends on when it reaches an activity
+
+The pilot's paths depended on data only. In these journeys a condition can compare a date with "Today", a wait
+can end a number of days before a date held in a field, and the exit criteria are checked when a wait expires.
+The simulation therefore carries a clock:
+
+- The clock starts at the **entry time**, a setting whose default is the generation time (the tester imports
+  the files and activates the journey right after generating them; the report gives the deadline by which this
+  must happen, see "Validity of the data").
+- A **wait by duration** advances the clock by its amount (a month counts 28 days, as before).
+- A **wait by attribute** holds the contact until the date in its field plus its offset (`waitDuration` and
+  `waitUnit`, which may be negative: "13 days before Entitle_RequestCancellationDate" is an offset of -13 days),
+  at the time of day given by `specifiedTime` when it has one, otherwise at the time of day held in the field.
+  When that moment is already past, the contact goes on at once (as before). When the field is null, the
+  contact goes on at once (assumption: the vendor documentation says a contact with no value proceeds).
+- A **send-time wait** advances the clock by nothing (the email may go out at once); its sliding window is noted
+  in the testbook as before.
+- An email and an SMS are sent at the clock time; `{{DateTime.Now}}` written by an Update contact is the clock
+  time; an engagement split is evaluated at the clock time, which is the deadline of its manual action.
+- Every case carries its **timeline**: the clock at every step of the expected path. The testbook writes it
+  as days from the entry time with the absolute date and time.
+
+Time zones: the clock is naive local time, the time zone of the waits (`W. Europe Standard Time` in these
+exports) is reported, and the assumption on the time zone applied to dates in the CSVs stays as before.
+
+### Relative dates in conditions
+
+A condition value written `;<sign>;<n>;<unit>` (for example `;+;0;days` or `;-;7;days`, shown in the
+interface as "Today", "Today Plus 90 days", "Today Minus 7 days") compares the field with the clock's date
+moved by `n` units. The operators that take such a value are `After`, `AtOrAfter`, `Before`, `AtOrBefore`;
+`IsNot` is the negation of `Is` (on a Boolean `IsNot true` is true for `false` and for null, assumption: the
+rule "any other operator on null is false" does not apply to a negated operator; `NotEqual` keeps its
+earlier reading, since the step 2 example `operators_text` fixes it).
+
+- Comparison level: with the unit `days`, `weeks`, `months` or `years` the field's date part is compared with
+  the clock's date part, as the interface says "Today" (confirmed by the team on 14 October 2026); with `hours`
+  or `minutes` the full date and time are compared with the clock ("Now") (assumption). Both bounds are
+  inclusive for `AtOrAfter` and `AtOrBefore`.
+- The same operators with an absolute date value keep the earlier reading (a value without a time compares
+  on the date part).
+- Any other value form, unit or operator is unsupported and reported as before.
+
+### Values of a date field read with relative dates or by a wait with an offset
+
+The step 2 rule "coverage values are chosen strictly inside the ranges the conditions define" is kept, but
+the ranges now move with the clock, so the values are chosen as offsets from the entry time:
+
+- For a field with at least one relative condition or one wait by attribute with an offset, the generator
+  lists the **cut points** in days: for each relative condition, `n` plus every fixed delay with which a
+  contact can reach that split (the sum of the waits by duration on each path from the start, waits by
+  attribute counting zero); for each wait by attribute on the field, minus its offset plus the same delays
+  (the value at which the wait ends exactly when the contact reaches it).
+- The candidate values are the entry time moved by every cut point and by every cut point plus or minus
+  one and two days, plus the absolute values named by the other conditions, plus null when the schema
+  allows it. Candidates that take the same branches at every split that reads the field, whatever the delay,
+  are one class; the generator keeps one value per class, chosen in this order: (1) among the candidates whose
+  validity (see "Validity of the data") reaches the setting "minimum validity of the data", or all of them when
+  none does; (2) the one that makes the waits by attribute on the field end soonest (so the test runs as early
+  as the margin allows; a setting of 0 lets them end at once); (3) not on a cut point; (4) the longest validity;
+  (5) the earliest date; null never represents a class that has a non-null member. It tries the classes like
+  any other domain. A case whose values are all not perishable has no validity (nothing in it depends on the
+  clock) and sets no deadline.
+- A wait by attribute with an offset no longer writes "the generation time plus the wait offset" into its
+  field when the field also has conditions: the field takes the candidate the case needs, and the
+  testbook says when the wait ends. A wait by attribute on a field with no condition keeps the earlier rule.
+- Some classes compare on a bound at the split whatever their value (the journey waits until "13 days before
+  the date" and then asks "is the date on or after Today plus 13 days": the wait makes the comparison fall on
+  the bound for every contact that arrives in time). The branch is still covered, by a value of that class
+  chosen with the rules above, and the testbook and the report say that the branch is decided on the bound of a
+  day-level comparison (confirmed by the team on 14 October 2026).
+
+### Validity of the data
+
+A value chosen relative to the entry time stops working when the test starts late: a holiday that "starts
+after Today" becomes current. The validity of a value is the number of whole days the entry time can slip
+before any condition on the field, at any delay a contact can reach it with, reads differently; the generator
+computes it by re-evaluating the conditions with the entry time moved by one day at a time (so an exclusive
+operator gives one day less than the distance from the cut point). A value that no slip of up to a year
+changes is not perishable and sets no deadline. The report and the testbook give the earliest validity over
+the cases as the deadline: "import the files and activate the journey by <date and time>" (the entry time plus
+that many days). Values are chosen so that this margin is at least the setting "minimum validity of the data"
+(default 1 day) wherever a class of values allows it, and no larger than a wait on the field needs, so that
+the test runs as early as the margin allows (a setting of 0 gives values on which every wait ends at once and
+the data must be activated the same day); a value with a smaller margin is reported.
+
+### Exit criteria and goals
+
+Journey Builder evaluates the exit criteria of a journey for each contact when the contact's time in a wait
+activity expires (documented), goals before exit criteria. The generator models exit criteria whose
+conditions it can evaluate (the same operators, data sources and relative dates as a decision split):
+
+- At the end of every wait on a path the exit criteria are evaluated with the clock; when they are true the
+  contact leaves the journey there. The expected path of such a case ends with "leaves the journey at the
+  end of <wait>, because the exit criteria are met", and the testbook says so.
+- Every exit criterion is one extra coverage target, "exit criteria met at the end of a wait", so that the
+  cover includes at least one case that leaves the journey this way when it is reachable; the summary
+  counts it apart from the branches of the splits.
+- A branch no contact can reach because every contact that gets to the wait before it meets the exit
+  criteria is reported as unreachable with that reason. (One of the six exports has `Entitle_RequestCancellationDate
+  is not null` as an exit criterion, which every contact its splits accept satisfies: the report must say that
+  every branch behind the first wait is unreachable for this reason, as a finding on the journey.)
+- Exit criteria with a condition the generator cannot evaluate are reported as not modelled, as in step 2;
+  goals are still reported, not modelled (no export of the cohort has one).
+
+### SMS sends
+
+`SMSSYNC` is a send to the phone number of the journey's default mobile number (`defaults.mobileNumber`,
+a column of the entry table, as `defaults.email` for emails). It has no branching. The spec rule "in each
+case whose path sends a message to a phone, one of the 3 contacts gets the tester's real number" applies:
+that contact's row holds the real number in the default mobile column (and in every column the entry query
+copies it from); the testbook's expected result names the SMS and the contact that receives it. Without a
+real number the SMS cannot be checked and the report says so; the send still happens on the path.
+
+### Tables reached through other tables
+
+A split condition or a wait by attribute can read a table that the contact model reaches through another
+table: in these exports `PublicHoliday_DE` is reached through `PublicHoliday_Entry` (contact key in
+`SubscriberKey`, link on `PHKey`). The export names the path: the attribute path of the condition (the
+relationship ids in `AttributePath` and `UiMetaData`) and the segments of the wait's attribute expression
+(`Contacts.PublicHoliday_Entry.PublicHoliday_DE."PHEnd"`).
+
+- Every table on the path from the contact to a read table is a **link table**: it gets a CSV, with the role
+  "link", because without its rows the journey cannot read the table at the end of the path.
+- Levels keep the rule of "Classify fields by level": the link table joined on the contact key is
+  contact-level, the table it points to through another field is scenario-level (one holiday row shared by
+  the contacts of a scenario), and the scenario key is written into the linking field of the link table.
+- When the export gives no path for a read table that no selected table joins, the generator looks for the
+  shortest chain of relationships from the contact to it and uses it with a warning; with no chain at all,
+  the earlier rule applies (one row shared by all contacts, assumption).
+
+### Columns the entry query derives and columns it copies
+
+- A column of the entry table copied as a plain column from a source table (`M.Entitle_RequestCancellationDate`)
+  holds the same value as its source: the two fields are **one variable** for the coverage (as the key
+  groups are for keys), so a Journey Data condition on the copy and a Contact Data condition on the source read
+  the same value, and the CSVs agree. The same holds through a chain of followed queries.
+- A column of the entry table that a split reads and that the entry query computes with an expression the
+  generator does not understand (a `CASE WHEN ... THEN 'True' ELSE 'False' END` on the timestamps of an
+  earlier run) takes the value the case needs (data rule 2), not a placeholder. The report says that the
+  automation would compute it from rows the generator does not reproduce, so the direct import of the CSVs
+  is the only procedure for which the expected results hold.
+- A filter comparing the date part of a column with the current date moved by a number of days
+  (`CAST(CM.CreatedDate AS DATE) = CAST(DATEADD(day, -1, GETDATE()) AS DATE)`) is understood: the column takes the
+  generation time moved by that number of days. The spelling with the current date cast first
+  (`DATEADD(day, -2, CAST(GETDATE() AS DATE))`) is the same filter.
+- A `LEFT JOIN` source still gets one row per contact (read as an inner join, as before); the report says so.
+- A column of the entry table that the query does not populate and whose schema default is the current date
+  (`GetDate()`) holds the generation time, as the other date fields; the trust check accepts it.
+
+### Synchronized data extensions
+
+A source table that Package Manager marks as a managed data extension (`NO_DEPLOY`,
+`ManagedDataExtension`: the Salesforce objects synchronized from the CRM, named like
+`CampaignMember_Salesforce_9`) is imported like every other CSV: its CSV is produced and is among the files to
+import, in the report and in the testbook. The report notes that the table is synchronized from the CRM
+(`NO_DEPLOY`, `ManagedDataExtension`), so the tester knows the rows will also arrive from the sync. Confirmed by
+the team on 14 October 2026.
+
+### Honest checks
+
+- The trust check on the entry query reports a column it cannot verify (an expression the generator does not
+  understand, a filter it does not understand, a LEFT JOIN read as an inner join) as "not verified", with the
+  reason, and fails only on what it can verify.
+- The simulation from the written files runs with the same clock and the same exit criteria as the coverage.
+- The report opens with the deadline for activation when the data is perishable, next to the warning on
+  unsupported elements.
+
+### Acceptance for step 3
+
+- On the pilot, every CSV and `scenarios.csv` stay byte-identical to the step 2 outputs (same time, run
+  identifier and seed); differences in report.md and the testbook are listed for the team.
+- The six exports run without errors; every decision, engagement and exit-criteria branch that the rules above
+  make reachable is covered; each construct above has a synthetic example in `examples/` with hand-derived
+  expected answers; the hand-derived answers for the six exports (kept outside the repository with the exports)
+  match the generator's output.

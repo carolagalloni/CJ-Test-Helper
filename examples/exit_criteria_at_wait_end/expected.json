@@ -1,0 +1,86 @@
+{
+  "journey_name": "EX_ExitCriteriaAtWaitEnd",
+  "activity_count": 5,
+  "csv_tables": [
+    "DE_Entry",
+    "DE_Master"
+  ],
+  "table_levels": {
+    "DE_Entry": "contact",
+    "DE_Master": "contact"
+  },
+  "branches": {
+    "SPLIT-1/path_a": {
+      "status": "covered"
+    },
+    "SPLIT-1/remainder_path": {
+      "status": "not covered",
+      "reason_contains": [
+        "criteri di uscita",
+        "criterio di uscita",
+        "exit criteria"
+      ]
+    }
+  },
+  "exit_targets": {
+    "EXITCRITERIA/met": {
+      "status": "covered"
+    }
+  },
+  "scenario_count": {
+    "min": 1,
+    "max": 1
+  },
+  "case_count": {
+    "min": 2,
+    "max": 2
+  },
+  "contact_count": 6,
+  "cases": [
+    {
+      "contact_values": {
+        "DE_Master.Status": "Active",
+        "DE_Master.IsDunning": "False"
+      },
+      "end_activity": "UPDATE-1",
+      "manual_actions": [],
+      "emails_sent": [
+        "EMAIL-1"
+      ],
+      "contact_count": 3,
+      "exit_by_criteria": null,
+      "timeline": {
+        "WAIT-1": "2026-10-12 12:00",
+        "SPLIT-1": "2026-10-12 12:00",
+        "EMAIL-1": "2026-10-12 12:00"
+      }
+    },
+    {
+      "end_activity": "WAIT-1",
+      "manual_actions": [],
+      "emails_sent": [],
+      "contact_count": 3,
+      "exit_by_criteria": "WAIT-1",
+      "timeline": {
+        "WAIT-1": "2026-10-12 12:00"
+      }
+    }
+  ],
+  "validity_days": null,
+  "unsupported": [],
+  "report_contains": [
+    [
+      "criteri di uscita",
+      "criterio di uscita",
+      "exit criteria"
+    ]
+  ],
+  "testbook_contains": [
+    [
+      "criteri di uscita",
+      "criterio di uscita",
+      "exit criteria"
+    ]
+  ],
+  "checks_pass": true
+}

@@ -1,0 +1,26 @@
+{
+  "journey_name": "EX_EntryCopyAlias",
+  "activity_count": 7,
+  "csv_tables": ["DE_Entry", "DE_Master"],
+  "table_levels": {"DE_Entry": "contact", "DE_Master": "contact"},
+  "branches": {
+    "SPLIT-1/path_a": {"status": "covered"},
+    "SPLIT-1/remainder_path": {"status": "covered"},
+    "SPLIT-2/path_a": {"status": "covered"},
+    "SPLIT-2/remainder_path": {"status": "not covered", "reason_contains": "non raggiungibile"},
+    "SPLIT-3/path_a": {"status": "not covered", "reason_contains": "non raggiungibile"},
+    "SPLIT-3/remainder_path": {"status": "covered"}
+  },
+  "scenario_count": {"min": 1, "max": 1},
+  "case_count": {"min": 2, "max": 2},
+  "contact_count": 6,
+  "cases": [
+    {"contact_values": {"DE_Master.Tier": "Gold"},
+     "end_activity": "UPDATE-1", "manual_actions": [], "contact_count": 3},
+    {"contact_constraints": {"DE_Master.Tier": {"not_null": true, "not_in": ["Gold"]}},
+     "end_activity": "UPDATE-4", "manual_actions": [], "contact_count": 3}
+  ],
+  "unsupported": [],
+  "checks_pass": true,
+  "csv_rows": {"DE_Entry": 6, "DE_Master": 6}
+}

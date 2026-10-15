@@ -1,0 +1,108 @@
+{
+  "journey_name": "EX_WaitOffsetThenRelativeSplit",
+  "activity_count": 5,
+  "csv_tables": [
+    "DE_Entry",
+    "DE_Master"
+  ],
+  "table_levels": {
+    "DE_Entry": "contact",
+    "DE_Master": "contact"
+  },
+  "branches": {
+    "SPLIT-1/path_a": {
+      "status": "covered"
+    },
+    "SPLIT-1/remainder_path": {
+      "status": "covered"
+    }
+  },
+  "scenario_count": {
+    "min": 1,
+    "max": 1
+  },
+  "case_count": {
+    "min": 2,
+    "max": 2
+  },
+  "contact_count": 6,
+  "cases": [
+    {
+      "contact_values": {
+        "DE_Master.EndDate": "2026-10-25 12:00"
+      },
+      "end_activity": "UPDATE-1",
+      "manual_actions": [],
+      "emails_sent": [
+        "EMAIL-1"
+      ],
+      "contact_count": 3,
+      "exit_by_criteria": null,
+      "validity_days": 1,
+      "timeline": {
+        "WAIT-1": "2026-10-12 12:00",
+        "SPLIT-1": "2026-10-12 12:00",
+        "EMAIL-1": "2026-10-12 12:00"
+      }
+    },
+    {
+      "contact_values": {
+        "DE_Master.EndDate": "2026-10-22 12:00"
+      },
+      "end_activity": "UPDATE-2",
+      "manual_actions": [],
+      "emails_sent": [],
+      "contact_count": 3,
+      "exit_by_criteria": null,
+      "timeline": {
+        "WAIT-1": "2026-10-11 12:00",
+        "SPLIT-1": "2026-10-11 12:00"
+      }
+    }
+  ],
+  "validity_days": 1,
+  "unsupported": [],
+  "report_head_contains": [
+    [
+      "2026-10-12",
+      "12/10/2026",
+      "12 ottobre 2026"
+    ]
+  ],
+  "report_contains": [
+    [
+      "confronto sul giorno",
+      "confronto per giorno",
+      "confronto a livello di giorno",
+      "livello del giorno",
+      "parte data",
+      "solo la data",
+      "day-level"
+    ],
+    [
+      "W. Europe Standard Time"
+    ],
+    [
+      "già passata",
+      "già nel passato"
+    ]
+  ],
+  "testbook_contains": [
+    [
+      "confronto sul giorno",
+      "confronto per giorno",
+      "confronto a livello di giorno",
+      "livello del giorno",
+      "parte data",
+      "solo la data",
+      "day-level"
+    ],
+    [
+      "2026-10-12",
+      "12/10/2026",
+      "12 ottobre 2026"
+    ]
+  ],
+  "csv_no_space_cells": true,
+  "checks_pass": true
+}

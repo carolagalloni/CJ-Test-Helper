@@ -1,0 +1,25 @@
+{
+  "journey_name": "EX_LeftJoinSourceRow",
+  "activity_count": 3,
+  "csv_tables": ["DE_Entry", "DE_Master", "DE_Score"],
+  "table_levels": {"DE_Entry": "contact", "DE_Master": "contact", "DE_Score": "contact"},
+  "table_roles": {"DE_Score": ["source"]},
+  "branches": {
+    "SPLIT-1/path_a": {"status": "covered"},
+    "SPLIT-1/remainder_path": {"status": "covered"}
+  },
+  "scenario_count": {"min": 1, "max": 1},
+  "case_count": {"min": 2, "max": 2},
+  "contact_count": 6,
+  "cases": [
+    {"contact_constraints": {"DE_Score.Score": {"not_null": true, "gt": 10}}, "has_row": {"DE_Score": true},
+     "end_activity": "UPDATE-1", "manual_actions": [], "contact_count": 3},
+    {"contact_constraints": {"DE_Score.Score": {"not_null": true, "lt": 10}}, "has_row": {"DE_Score": true},
+     "end_activity": "UPDATE-2", "manual_actions": [], "contact_count": 3}
+  ],
+  "unsupported": [],
+  "checks_pass": true,
+  "csv_no_space_cells": true,
+  "report_contains": ["LEFT JOIN", "DE_Score", ["non verificat", "not verified"]],
+  "csv_rows": {"DE_Entry": 6, "DE_Master": 6, "DE_Score": 6}
+}

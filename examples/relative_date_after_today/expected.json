@@ -1,0 +1,96 @@
+{
+  "journey_name": "EX_RelativeDateAfterToday",
+  "activity_count": 5,
+  "csv_tables": [
+    "DE_Entry",
+    "DE_Master"
+  ],
+  "table_levels": {
+    "DE_Entry": "contact",
+    "DE_Master": "contact"
+  },
+  "branches": {
+    "SPLIT-1/path_a": {
+      "status": "covered"
+    },
+    "SPLIT-1/path_b": {
+      "status": "covered"
+    },
+    "SPLIT-1/remainder_path": {
+      "status": "covered"
+    }
+  },
+  "scenario_count": {
+    "min": 1,
+    "max": 1
+  },
+  "case_count": {
+    "min": 3,
+    "max": 3
+  },
+  "contact_count": 9,
+  "cases": [
+    {
+      "contact_values": {
+        "DE_Master.StartDate": "2026-10-13 12:00"
+      },
+      "end_activity": "UPDATE-1",
+      "manual_actions": [],
+      "emails_sent": [
+        "EMAIL-1"
+      ],
+      "contact_count": 3,
+      "exit_by_criteria": null,
+      "validity_days": 1,
+      "timeline": {
+        "SPLIT-1": "2026-10-11 12:00",
+        "EMAIL-1": "2026-10-11 12:00"
+      }
+    },
+    {
+      "contact_values": {
+        "DE_Master.StartDate": "2026-10-09 12:00"
+      },
+      "end_activity": "UPDATE-2",
+      "manual_actions": [],
+      "emails_sent": [],
+      "contact_count": 3,
+      "exit_by_criteria": null,
+      "timeline": {
+        "SPLIT-1": "2026-10-11 12:00"
+      }
+    },
+    {
+      "contact_values": {
+        "DE_Master.StartDate": null
+      },
+      "end_activity": "UPDATE-3",
+      "manual_actions": [],
+      "emails_sent": [],
+      "contact_count": 3,
+      "exit_by_criteria": null,
+      "validity_days": null,
+      "timeline": {
+        "SPLIT-1": "2026-10-11 12:00"
+      }
+    }
+  ],
+  "validity_days": 1,
+  "unsupported": [],
+  "report_head_contains": [
+    [
+      "2026-10-12",
+      "12/10/2026",
+      "12 ottobre 2026"
+    ]
+  ],
+  "testbook_contains": [
+    [
+      "2026-10-12",
+      "12/10/2026",
+      "12 ottobre 2026"
+    ]
+  ],
+  "csv_no_space_cells": true,
+  "checks_pass": true
+}

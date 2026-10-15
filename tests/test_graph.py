@@ -1,9 +1,15 @@
 from datetime import datetime
 
-from cjhelper import graph
-from cjhelper.model import KIND_UPDATE, Step
+import pytest
+
+from cjhelper import criteria, graph
+from cjhelper.model import (
+    KIND_SMS, KIND_WAIT_STO, SOURCE_JOURNEY, Activity, Condition, JourneyFilter, Outcome, Step,
+    TimelinePoint,
+)
 from tests.helpers import (
     AND, OR, cond, decision, email, email_asset, engagement, field, journey, package, table, unsupported, update,
+    wait_attr, wait_dur,
 )
 
 MASTER = table("DE_Master", [field("ContactId", pk=True, nullable=False), field("Perm", "Boolean"),
@@ -119,7 +125,7 @@ def test_loop_and_dangling_are_reported():
 
 
 def test_unsupported_activity_stops_the_path():
-    acts = [unsupported("X-1", "SMSSYNC", "U-1"), update("U-1", "a", [], None)]
+    acts = [unsupported("X-1", "SALESCLOUDACTIVITY", "U-1"), update("U-1", "a", [], None)]
     w, j = build_walker(acts)
     st = w.run(w.start(), lookup_from({}))
     assert st.stop == graph.STOP_UNSUPPORTED
@@ -310,3 +316,406 @@ def test_fixed_wait_minutes_and_case_paths():
     case = Case("S01-C01", "S01", 1, {}, [Step("U-1", "o"), Step("R-1", None)], [], [], [], [], "R-1", 50,
                 random=RandomInfo("R-1", [branch], 1, 9))
     assert graph.case_paths(case) == [["U-1", "R-1", "U-2"]]
+
+
+# ---------------------------------------------------------------------------
+# Spec, "Extensions for time-dependent journeys (step 3)": the clock, waits, exit criteria, SMS, fixed delays
+# ---------------------------------------------------------------------------
+
+ENTRY_TIME = datetime(2026, 10, 11, 12, 0)
+DATED = table("DE_Dated", [field("ContactId", pk=True, nullable=False), field("EndDate", "Date"),
+                           field("Status", "Text", length=20)], sendable_field="ContactId")
+END_DATE = ("DE_Dated", "EndDate")
+STATUS = ("DE_Dated", "Status")
+
+
+def clock_walker(acts, exits=(), entry_time=None, predicate=None, tables=(MASTER, ENTRY, DATED), row_fields=None):
+    j = journey(acts)
+    j.exits = list(exits)
+    w = graph.Walker(j, graph.Schema({t.name: t for t in tables}), {}, False, ENTRY_TIME, entry_time=entry_time,
+                     ends_at_once_when_unknown=predicate, row_fields=row_fields)
+    return w, j
+
+
+def sto(key, next_key):
+    return Activity(key=key, raw_type="STOWAIT", kind=KIND_WAIT_STO, name="sto",
+                    outcomes=[Outcome(key=key + "-out", label="", next=next_key)], wait_amount=24, wait_unit="HOURS")
+
+
+def sms(key, next_key, with_outcome=True):
+    outcomes = [Outcome(key=key + "-out", label="", next=next_key)] if with_outcome else []
+    return Activity(key=key, raw_type="SMSSYNC", kind=KIND_SMS, name=key, outcomes=outcomes, sms_name=key)
+
+
+def offset_wait(key, next_key, amount=None, unit=None, time_of_day=None):
+    act = wait_attr(key, "DE_Dated", "EndDate", next_key)
+    act.wait_offset_amount, act.wait_offset_unit, act.wait_time_of_day = amount, unit, time_of_day
+    return act
+
+
+def relative(table_name, field_name, operator, text):
+    return Condition(table_name, field_name, operator, text, relative=criteria.relative_date(text))
+
+
+def times(state):
+    """Activity key -> the clock of its step."""
+    return {p.activity_key: p.at for p in state.timeline}
+
+
+def assert_timeline_matches_steps(state):
+    assert len(state.timeline) == len(state.steps)
+    assert [(p.activity_key, p.outcome_key) for p in state.timeline] == [(s.activity_key, s.outcome_key)
+                                                                         for s in state.steps]
+
+
+def test_clock_starts_at_the_entry_time_and_waits_by_duration_advance_it():
+    """Spec, step 3: "A wait by duration advances the clock by its amount (a month counts 28 days, as before)";
+    "A send-time wait advances the clock by nothing"; the clock starts at the entry time."""
+    acts = [wait_dur("W-1", 2, "DAYS", "W-2"), wait_dur("W-2", 3, "HOURS", "W-3"), wait_dur("W-3", 1, "MONTHS", "W-4"),
+            wait_dur("W-4", 30, "MINUTES", "STO-1"), sto("STO-1", "W-5"), wait_dur("W-5", 1, "Week", "U-1"),
+            update("U-1", "u", [], None)]
+    w, j = clock_walker(acts)
+    st = w.start()
+    assert st.clock == ENTRY_TIME
+    st = w.run(st, lookup_from({}))
+    assert st.stop == graph.STOP_EXIT and st.waits == ["W-1", "W-2", "W-3", "W-4", "STO-1", "W-5"]
+    assert_timeline_matches_steps(st)
+    assert times(st) == {
+        "W-1": datetime(2026, 10, 13, 12, 0), "W-2": datetime(2026, 10, 13, 15, 0),
+        "W-3": datetime(2026, 11, 10, 15, 0),            # 28 days, not the calendar month
+        "W-4": datetime(2026, 11, 10, 15, 30), "STO-1": datetime(2026, 11, 10, 15, 30),
+        "W-5": datetime(2026, 11, 17, 15, 30), "U-1": datetime(2026, 11, 17, 15, 30),
+    }
+    assert st.clock == datetime(2026, 11, 17, 15, 30)
+    # The entry time is a setting: the clock starts there, not at the generation time.
+    w, j = clock_walker(acts, entry_time=datetime(2026, 10, 20, 8, 0))
+    st = w.run(w.start(), lookup_from({}))
+    assert st.timeline[0].at == datetime(2026, 10, 22, 8, 0)
+    # A duration that cannot be read advances the clock by nothing (it counts 0 in fixed_delays too).
+    w, j = clock_walker([wait_dur("W-1", 3, "FORTNIGHTS", "U-1"), update("U-1", "u", [], None)])
+    st = w.run(w.start(), lookup_from({}))
+    assert st.stop == graph.STOP_EXIT and times(st) == {"W-1": ENTRY_TIME, "U-1": ENTRY_TIME}
+
+
+def test_wait_end_applies_the_offset_and_the_time_of_day():
+    """Spec, step 3: "until the date in its field plus its offset (waitDuration and waitUnit, which may be
+    negative ...), at the time of day given by specifiedTime when it has one, otherwise at the time of day held
+    in the field"."""
+    day = datetime(2026, 10, 26, 18, 45)
+    assert graph.wait_end(offset_wait("W", None), day) == day
+    assert graph.wait_end(offset_wait("W", None, 2, "DAYS"), day) == datetime(2026, 10, 28, 18, 45)
+    assert graph.wait_end(offset_wait("W", None, -13, "DAYS"), day) == datetime(2026, 10, 13, 18, 45)
+    assert graph.wait_end(offset_wait("W", None, -13, "days", "09:30"), day) == datetime(2026, 10, 13, 9, 30)
+    assert graph.wait_end(offset_wait("W", None, None, None, "7:05"), datetime(2026, 10, 20, 23, 59, 30)) \
+        == datetime(2026, 10, 20, 7, 5)
+    assert graph.wait_end(offset_wait("W", None, -2, "HOURS"), day) == datetime(2026, 10, 26, 16, 45)
+    assert graph.wait_end(offset_wait("W", None, 1, "WEEK"), day) == datetime(2026, 11, 2, 18, 45)
+    # Calendar months for the offset (criteria.shift_date), clamped to the end of a shorter month.
+    assert graph.wait_end(offset_wait("W", None, 1, "MONTHS"), datetime(2026, 1, 31, 10, 0)) \
+        == datetime(2026, 2, 28, 10, 0)
+    with pytest.raises(criteria.UnsupportedOperator):
+        graph.wait_end(offset_wait("W", None, 3, "FORTNIGHTS"), day)
+    with pytest.raises(criteria.UnsupportedOperator):
+        graph.wait_end(offset_wait("W", None, None, None, "half past nine"), day)
+
+
+def run_attr_wait(value, amount=None, unit=None, time_of_day=None, predicate=None):
+    w, j = clock_walker([offset_wait("W-1", "U-1", amount, unit, time_of_day), update("U-1", "u", [], None)],
+                        predicate=predicate)
+    values = {} if value is graph.UNKNOWN else {END_DATE: value}
+    return w.run(w.start(), lookup_from(values)), w
+
+
+def test_wait_by_attribute_holds_the_contact_until_its_date():
+    """Spec, step 3: the wait ends at the date plus the offset; "When that moment is already past, the contact goes
+    on at once"; "When the field is null, the contact goes on at once (assumption)"."""
+    st, _ = run_attr_wait("2026-10-20 08:15", 2, "DAYS")
+    assert st.stop == graph.STOP_EXIT and st.waits == ["W-1"]
+    assert times(st) == {"W-1": datetime(2026, 10, 22, 8, 15), "U-1": datetime(2026, 10, 22, 8, 15)}
+    assert_timeline_matches_steps(st)
+    st, _ = run_attr_wait("2026-10-26 12:00", -13, "DAYS")
+    assert times(st)["W-1"] == datetime(2026, 10, 13, 12, 0)
+    st, _ = run_attr_wait("2026-10-26 12:00", -13, "DAYS", "09:30")
+    assert times(st)["W-1"] == datetime(2026, 10, 13, 9, 30)
+    st, _ = run_attr_wait("2026-10-20 18:45", None, None, "09:30")
+    assert times(st)["W-1"] == datetime(2026, 10, 20, 9, 30)
+    st, _ = run_attr_wait("2026-10-20")                      # a date alone: midnight
+    assert times(st)["W-1"] == datetime(2026, 10, 20, 0, 0)
+    # Already past, by the date itself or once the negative offset is applied: the contact goes on at once.
+    for value, amount in (("2026-10-01 12:00", None), ("2026-10-22 12:00", -13)):
+        st, _ = run_attr_wait(value, amount, "DAYS")
+        assert st.stop == graph.STOP_EXIT and times(st)["W-1"] == ENTRY_TIME
+    # A time of day that falls before the clock on the same day is past too.
+    st, _ = run_attr_wait("2026-10-11 23:00", None, None, "09:00")
+    assert times(st)["W-1"] == ENTRY_TIME
+    # Null, or a value that is not a readable date: the wait ends at once and the walk goes on.
+    for value in (None, "", "not a date"):
+        st, _ = run_attr_wait(value, -13, "DAYS")
+        assert st.stop == graph.STOP_EXIT and st.waits == ["W-1"] and times(st)["W-1"] == ENTRY_TIME
+    # An offset unit the generator does not know: the end of the wait cannot be computed, the path is unknown.
+    st, _ = run_attr_wait("2026-10-26 12:00", 3, "FORTNIGHTS")
+    assert st.stop == graph.STOP_ERROR and st.steps == [Step("W-1", None)] and st.current == "W-1"
+    assert "FORTNIGHTS" in st.stop_detail
+    assert_timeline_matches_steps(st)
+
+
+def test_wait_by_attribute_on_an_undecided_field():
+    """Without a predicate the wait ends at once (the behaviour before step 3); with it, the caller decides: True
+    ends the wait at once, False stops the walk on the field so the caller can branch on its values."""
+    st, _ = run_attr_wait(graph.UNKNOWN, -13, "DAYS")
+    assert st.stop == graph.STOP_EXIT and times(st)["W-1"] == ENTRY_TIME
+    asked = []
+    st, _ = run_attr_wait(graph.UNKNOWN, -13, "DAYS", predicate=lambda ref: asked.append(ref) or True)
+    assert st.stop == graph.STOP_EXIT and times(st)["W-1"] == ENTRY_TIME and asked == [END_DATE]
+    st, w = run_attr_wait(graph.UNKNOWN, -13, "DAYS", predicate=lambda ref: False)
+    assert st.stop == graph.STOP_UNDETERMINED and st.pending_field == END_DATE
+    assert st.current == "W-1" and "W-1" not in st.visited
+    assert st.steps == [] and st.timeline == [] and st.waits == [] and st.clock == ENTRY_TIME
+    # The caller assigns the field and re-runs the wait from a copy of the state.
+    child = w.run(st.clone(), lookup_from({END_DATE: "2026-10-26 12:00"}))
+    assert child.stop == graph.STOP_EXIT and child.waits == ["W-1"]
+    assert times(child) == {"W-1": datetime(2026, 10, 13, 12, 0), "U-1": datetime(2026, 10, 13, 12, 0)}
+
+
+def test_wait_by_attribute_reads_the_value_an_update_contact_wrote():
+    """Contact Data is read live: an Update contact that writes the date moves the end of the wait."""
+    acts = [update("U-0", "set", [("DE_Dated", "EndDate", "2026-10-30 07:00")], "W-1"),
+            offset_wait("W-1", "U-1"), update("U-1", "u", [], None)]
+    w, j = clock_walker(acts)
+    st = w.run(w.start(), lookup_from({END_DATE: "2026-10-12 12:00"}))
+    assert times(st)["W-1"] == datetime(2026, 10, 30, 7, 0)
+
+
+def test_relative_date_decision_reads_the_clock_after_a_wait():
+    """Spec, step 3: a relative date "compares the field with the clock's date moved by n units". A field one day
+    after the entry time is "After Today" at entry, and no longer after a wait of two days."""
+    after_today = relative("DE_Dated", "EndDate", "After", ";+;0;days")
+    split = decision("SPLIT-1", "after today?", [("a", "A", "U-A", after_today)], remainder_next="U-R")
+    tail = [update("U-A", "A", [], None), update("U-R", "R", [], None)]
+    lookup = lookup_from({END_DATE: "2026-10-12 12:00"})
+    w, j = clock_walker([split] + tail)
+    st = w.run(w.start(), lookup)
+    assert st.steps[0] == Step("SPLIT-1", "a") and times(st)["SPLIT-1"] == ENTRY_TIME
+    split = decision("SPLIT-1", "after today?", [("a", "A", "U-A", after_today)], remainder_next="U-R")
+    w, j = clock_walker([wait_dur("W-1", 2, "DAYS", "SPLIT-1"), split] + tail)
+    st = w.run(w.start(), lookup)
+    assert st.steps[1] == Step("SPLIT-1", "remainder_path")
+    assert times(st)["SPLIT-1"] == datetime(2026, 10, 13, 12, 0)
+    # evaluate passes the clock to the criteria; without it a relative date cannot be evaluated.
+    s = graph.Schema({t.name: t for t in (DATED,)})
+    assert graph.evaluate(after_today, lookup, s, False, now=ENTRY_TIME) is True
+    assert graph.evaluate(after_today, lookup, s, False, now=datetime(2026, 10, 13, 12, 0)) is False
+    with pytest.raises(criteria.UnsupportedOperator):
+        graph.evaluate(after_today, lookup, s, False)
+
+
+def gone(source="contact", name="EXITCRITERIA"):
+    formula = Condition("DE_Dated", "Status", "Equal", "Gone", source=source)
+    return JourneyFilter(key=name, name=name, kind="exit", formula=formula, description="Status is Gone")
+
+
+def exit_journey(first=None):
+    """[U-0 writes Status = Gone] -> W-1 (1 day) -> U-1."""
+    acts = [wait_dur("W-1", 1, "DAYS", "U-1"), update("U-1", "u", [], None)]
+    if first is not None:
+        acts.insert(0, first)
+    return acts
+
+
+def test_exit_criteria_are_evaluated_at_the_end_of_a_wait():
+    """Spec, step 3: "At the end of every wait on a path the exit criteria are evaluated with the clock; when they
+    are true the contact leaves the journey there", with the data sources of a decision split."""
+    write_gone = update("U-0", "set", [("DE_Dated", "Status", "Gone")], "W-1")
+    # Contact Data, read live: the value the Update contact wrote meets the criterion.
+    w, j = clock_walker(exit_journey(write_gone), exits=[gone()])
+    st = w.run(w.start(), lookup_from({STATUS: "Active"}))
+    assert st.stop == graph.STOP_EXIT_CRITERIA and st.current is None and st.exit_by_criteria == "W-1"
+    assert st.steps == [Step("U-0", "U-0-out"), Step("W-1", None)] and st.waits == ["W-1"]
+    assert st.timeline[-1] == TimelinePoint("W-1", None, datetime(2026, 10, 12, 12, 0))
+    assert_timeline_matches_steps(st)
+    assert "Status is Gone" in st.stop_detail and "W-1" in st.stop_detail
+    # Journey Data reads the snapshot taken at entry: the write does not change it, the contact stays.
+    w, j = clock_walker(exit_journey(write_gone), exits=[gone(SOURCE_JOURNEY)])
+    st = w.run(w.start(), lookup_from({STATUS: "Active"}))
+    assert st.stop == graph.STOP_EXIT and st.exit_by_criteria is None
+    assert st.steps[1:] == [Step("W-1", "W-1-out"), Step("U-1", "U-1-out")]
+    # ... and it meets the criterion when the entry row holds the value.
+    st = w.run(w.start(), lookup_from({STATUS: "Gone"}))
+    assert st.stop == graph.STOP_EXIT_CRITERIA
+    # False: the walk goes on.
+    w, j = clock_walker(exit_journey(), exits=[gone()])
+    st = w.run(w.start(), lookup_from({STATUS: "Active"}))
+    assert st.stop == graph.STOP_EXIT and st.steps == [Step("W-1", "W-1-out"), Step("U-1", "U-1-out")]
+
+
+def test_exit_criteria_on_an_undecided_field_stop_the_walk_before_the_wait_ends():
+    w, j = clock_walker(exit_journey(), exits=[gone()])
+    st = w.run(w.start(), lookup_from({}))
+    assert st.stop == graph.STOP_UNDETERMINED and st.pending_field == STATUS
+    assert st.current == "W-1" and "W-1" not in st.visited
+    assert st.steps == [] and st.waits == [] and st.clock == ENTRY_TIME
+    # The caller assigns the field and re-runs the wait: the clock moves once.
+    child = w.run(st.clone(), lookup_from({STATUS: "Gone"}))
+    assert child.stop == graph.STOP_EXIT_CRITERIA and child.waits == ["W-1"]
+    assert child.timeline == [TimelinePoint("W-1", None, datetime(2026, 10, 12, 12, 0))]
+    child = w.run(st.clone(), lookup_from({STATUS: "Active"}))
+    assert child.stop == graph.STOP_EXIT and child.clock == datetime(2026, 10, 12, 12, 0)
+    # A criterion that is true decides whatever the others still need.
+    unknown_first = JourneyFilter("EX-1", "EX-1", "exit", cond("DE_Master", "Channel", "Equal", "X"))
+    w, j = clock_walker(exit_journey(), exits=[unknown_first, gone(name="EX-2")])
+    st = w.run(w.start(), lookup_from({STATUS: "Gone"}))
+    assert st.stop == graph.STOP_EXIT_CRITERIA and "EX-2" in st.stop_detail
+
+
+def test_exit_criteria_are_never_evaluated_without_a_wait_and_only_when_evaluable():
+    """Exit criteria are checked "when the contact's time in a wait activity expires": not elsewhere. Criteria
+    the generator cannot evaluate are reported, not modelled."""
+    always = JourneyFilter("EX-1", "EX-1", "exit", cond("DE_Dated", "Status", "IsNull"))
+    w, j = clock_walker([update("U-1", "a", [], "U-2"), update("U-2", "b", [], None)], exits=[always, gone()])
+    st = w.run(w.start(), lookup_from({}))      # the criteria would be true, or need a value, if evaluated
+    assert st.stop == graph.STOP_EXIT and st.exit_by_criteria is None
+    not_modelled = JourneyFilter("EX-1", "EX-1", "exit", cond("DE_Dated", "Status", "IsNull"),
+                                 unsupported_reason="relationship missing in the export")
+    no_formula = JourneyFilter("EX-2", "EX-2", "exit", None, unsupported_reason="nessun criterio")
+    w, j = clock_walker(exit_journey(), exits=[not_modelled, no_formula])
+    st = w.run(w.start(), lookup_from({}))
+    assert st.stop == graph.STOP_EXIT and st.steps[0] == Step("W-1", "W-1-out")
+    assert graph.evaluable_exits(j) == []
+    # An operator the PoC cannot evaluate (the loader marks such criteria unsupported): the path is unknown.
+    odd = JourneyFilter("EX-3", "EX-3", "exit", cond("DE_Dated", "Status", "Weird", "x"))
+    w, j = clock_walker(exit_journey(), exits=[odd])
+    st = w.run(w.start(), lookup_from({STATUS: "Active"}))
+    assert st.stop == graph.STOP_ERROR and st.steps == [Step("W-1", None)] and "Weird" in st.stop_detail
+    assert_timeline_matches_steps(st)
+
+
+def test_exit_criteria_read_the_clock_at_the_end_of_each_wait():
+    """A relative date in the exit criteria compares with the clock when the wait ends: a send-time wait ends at
+    once and keeps the contact, the wait of two days that follows takes it out."""
+    expired = JourneyFilter("EXIT", "EXIT", "exit", relative("DE_Dated", "EndDate", "Before", ";+;0;days"),
+                            description="EndDate before today")
+    acts = [sto("STO-1", "W-1"), wait_dur("W-1", 2, "DAYS", "U-1"), update("U-1", "u", [], None)]
+    w, j = clock_walker(acts, exits=[expired])
+    st = w.run(w.start(), lookup_from({END_DATE: "2026-10-12 12:00"}))
+    assert st.steps == [Step("STO-1", "STO-1-out"), Step("W-1", None)] and st.exit_by_criteria == "W-1"
+    assert times(st) == {"STO-1": ENTRY_TIME, "W-1": datetime(2026, 10, 13, 12, 0)}
+    # After a wait by attribute too.
+    acts = [offset_wait("W-1", "U-1", 1, "DAYS"), update("U-1", "u", [], None)]
+    w, j = clock_walker(acts, exits=[expired])
+    st = w.run(w.start(), lookup_from({END_DATE: "2026-10-12 12:00"}))
+    assert st.stop == graph.STOP_EXIT_CRITERIA and times(st) == {"W-1": datetime(2026, 10, 13, 12, 0)}
+
+
+def test_timeline_has_one_point_per_step_with_the_clock():
+    """Spec, step 3: "Every case carries its timeline: the clock at every step of the expected path"; an email
+    and an SMS are sent and an engagement split is evaluated at the clock time."""
+    emails = {"A1": email_asset("A1", "Demo", has_link=False)}
+    acts = [decision("SPLIT-1", "s", [("a", "A", "EMAIL-1", cond("DE_Master", "Channel", "Equal", "X"))],
+                     remainder_next=None),
+            email("EMAIL-1", "Demo", "A1", "W-1"), wait_dur("W-1", 1, "DAYS", "ENG-1"),
+            engagement("ENG-1", "open", "open", "EMAIL-1", "SMS-1", None), sms("SMS-1", "W-2"),
+            wait_dur("W-2", 2, "HOURS", "U-1"), update("U-1", "u", [], None)]
+    j = journey(acts)
+    w = graph.Walker(j, schema(), emails, False, ENTRY_TIME)
+    st = w.run(w.start(), lookup_from({("DE_Master", "Channel"): "X"}))
+    assert st.stop == graph.STOP_CHOICE and st.current == "ENG-1"
+    w.take(st, j.activities["ENG-1"], j.activities["ENG-1"].outcomes[0])
+    w.run(st, lookup_from({("DE_Master", "Channel"): "X"}))
+    day1, later = datetime(2026, 10, 12, 12, 0), datetime(2026, 10, 12, 14, 0)
+    assert st.timeline == [
+        TimelinePoint("SPLIT-1", "a", ENTRY_TIME), TimelinePoint("EMAIL-1", "EMAIL-1-out", ENTRY_TIME),
+        TimelinePoint("W-1", "W-1-out", day1), TimelinePoint("ENG-1", "branchResult-1", day1),
+        TimelinePoint("SMS-1", "SMS-1-out", day1), TimelinePoint("W-2", "W-2-out", later),
+        TimelinePoint("U-1", "U-1-out", later),
+    ]
+    assert_timeline_matches_steps(st)
+    assert st.emails_sent == ["EMAIL-1"] and st.sms_sent == ["SMS-1"]
+    # A copy carries the clock and keeps its own lists.
+    copy = st.clone()
+    assert copy.clock == later and copy.timeline == st.timeline and copy.sms_sent == ["SMS-1"]
+    copy.timeline.append(TimelinePoint("X", None, later))
+    copy.sms_sent.append("X")
+    assert len(st.timeline) == 7 and st.sms_sent == ["SMS-1"]
+
+
+def test_sms_is_a_send_without_branching():
+    """Spec, step 3, "SMS sends": "SMSSYNC is a send ... It has no branching"."""
+    w, j = clock_walker([sms("SMS-1", "U-1"), update("U-1", "u", [], None)])
+    st = w.run(w.start(), lookup_from({}))
+    assert st.stop == graph.STOP_EXIT and st.sms_sent == ["SMS-1"] and st.emails_sent == []
+    assert st.steps == [Step("SMS-1", "SMS-1-out"), Step("U-1", "U-1-out")]
+    assert not graph.is_split(j.activities["SMS-1"])
+    # Without an outcome the contact leaves the journey there, as after an email with none.
+    w, j = clock_walker([sms("SMS-1", None, with_outcome=False)])
+    st = w.run(w.start(), lookup_from({}))
+    assert st.stop == graph.STOP_EXIT and st.steps == [Step("SMS-1", None)] and st.sms_sent == ["SMS-1"]
+    assert st.exit_by_criteria is None
+
+
+def test_datetime_now_written_by_an_update_contact_is_the_clock():
+    """Spec, step 3: "{{DateTime.Now}} written by an Update contact is the clock time"."""
+    acts = [wait_dur("W-1", 2, "DAYS", "UPD-1"),
+            update("UPD-1", "set", [("DE_Master", "Channel", "{{DateTime.Now}}")], None)]
+    w, j = clock_walker(acts)
+    st = w.run(w.start(), lookup_from({}))
+    assert st.overrides[("DE_Master", "Channel")] == "2026-10-13 12:00"
+    assert st.writes[0].value == "2026-10-13 12:00"
+    w, j = clock_walker(acts[1:], entry_time=datetime(2026, 10, 20, 8, 0))
+    st = w.run(w.start(), lookup_from({}))
+    assert st.overrides[("DE_Master", "Channel")] == "2026-10-20 08:00"
+
+
+def test_current_date_default_of_an_inserted_row_is_the_clock_at_the_insert():
+    form = table("DE_Form", [field("ContactId", pk=True, nullable=False), field("Seen", "Date", default="GETDATE()"),
+                             field("Source", "Text", length=20)], sendable_field="ContactId")
+    acts = [wait_dur("W-1", 1, "DAYS", "UPD-1"), update("UPD-1", "record", [("DE_Form", "Source", "Journey")], "W-2"),
+            wait_dur("W-2", 1, "DAYS", None)]
+    w, j = clock_walker(acts, tables=(MASTER, ENTRY, form), row_fields={"DE_Form": ("DE_Form", "ContactId")})
+    lookup = lookup_from({("DE_Form", "ContactId"): None, ("DE_Form", "Seen"): None})
+    st = w.run(w.start(), lookup)
+    assert st.clock == datetime(2026, 10, 13, 12, 0)
+    assert w.value_of(st, ("DE_Form", "Seen"), lookup) == "2026-10-12 12:00"
+
+
+def test_fixed_delays_on_a_diamond():
+    """Spec, step 3: the cut points use "every fixed delay with which a contact can reach that split (the sum of
+    the waits by duration on each path from the start, waits by attribute counting zero)"."""
+    acts = [decision("D-1", "s", [("a", "A", "W-A", cond("DE_Master", "Perm", "Is", "true"))], remainder_next="WA-1"),
+            wait_dur("W-A", 2, "DAYS", "J-1"),
+            offset_wait("WA-1", "W-B", -13, "DAYS"), wait_dur("W-B", 3, "HOURS", "STO-1"), sto("STO-1", "J-1"),
+            update("J-1", "join", [], "W-C"), wait_dur("W-C", 1, "DAYS", "END"), update("END", "end", [], None),
+            update("ORPHAN", "never reached", [], "END")]
+    j = journey(acts)
+    j.start_key = "D-1"
+    delays, warnings = graph.fixed_delays(j)
+    assert warnings == []
+    assert delays == {"D-1": {0.0}, "W-A": {0.0}, "WA-1": {0.0}, "W-B": {0.0}, "STO-1": {0.125}, "J-1": {2.0, 0.125},
+                      "W-C": {2.0, 0.125}, "END": {3.0, 1.125}, "ORPHAN": set()}
+
+
+def test_fixed_delays_report_an_unknown_duration_once_and_cap_the_sets():
+    acts = [decision("D-1", "s", [("a", "A", "W-A", cond("DE_Master", "Perm", "Is", "true"))], remainder_next="J-1"),
+            wait_dur("W-A", 1, "DAYS", "J-1"), update("J-1", "join", [], "W-X"),
+            wait_dur("W-X", 3, "FORTNIGHTS", "END"), update("END", "end", [], None)]
+    delays, warnings = graph.fixed_delays(journey(acts))
+    assert delays["END"] == {0.0, 1.0}
+    assert len(warnings) == 1 and "W-X" in warnings[0] and "FORTNIGHTS" in warnings[0]
+    # Six splits in a row, each with or without a wait of 2^i minutes: 64 delays reach the end, 32 are kept.
+    acts = []
+    for i in range(6):
+        nxt = f"D-{i + 1}" if i < 5 else "END"
+        acts += [decision(f"D-{i}", "s", [("a", "A", f"W-{i}", cond("DE_Master", "Perm", "Is", "true"))],
+                          remainder_next=nxt),
+                 wait_dur(f"W-{i}", 2 ** i, "MINUTES", nxt)]
+    acts.append(update("END", "end", [], None))
+    delays, warnings = graph.fixed_delays(journey(acts))
+    assert len(delays["D-5"]) == 32 and delays["END"] == {m / 1440 for m in range(32)}
+    assert len(warnings) == 1 and "'END'" in warnings[0] and "32" in warnings[0]
+
+
+def test_fixed_delays_do_not_follow_a_loop():
+    acts = [update("U-1", "a", [], "W-1"), wait_dur("W-1", 1, "DAYS", "U-2"), update("U-2", "b", [], "U-1")]
+    j = journey(acts)
+    j.start_key = "U-1"
+    delays, warnings = graph.fixed_delays(j)
+    assert delays == {"U-1": {0.0}, "W-1": {0.0}, "U-2": {1.0}} and warnings == []

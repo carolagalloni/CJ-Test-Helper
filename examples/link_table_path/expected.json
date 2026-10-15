@@ -1,0 +1,40 @@
+{
+  "journey_name": "EX_LinkTablePath",
+  "activity_count": 5,
+  "csv_tables": ["DE_HL_Entry", "Holiday_Entry", "Holiday_DE"],
+  "table_levels": {"DE_HL_Entry": "contact", "Holiday_Entry": "contact", "Holiday_DE": "scenario"},
+  "table_roles": {"DE_HL_Entry": ["entry"], "Holiday_Entry": ["link"], "Holiday_DE": ["split"]},
+  "branches": {
+    "SPLIT-1/path_a": {"status": "covered"},
+    "SPLIT-1/path_b": {"status": "covered"},
+    "SPLIT-1/remainder_path": {"status": "covered"}
+  },
+  "scenario_count": {"min": 3, "max": 3},
+  "case_count": {"min": 3, "max": 3},
+  "contact_count": 9,
+  "cases": [
+    {"scenario_values": {"Holiday_DE.HStart": "2026-10-13 12:00"}, "has_row": {"Holiday_Entry": true},
+     "end_activity": "EMAIL-1", "emails_sent": ["EMAIL-1"], "manual_actions": [], "contact_count": 3,
+     "validity_days": 1, "timeline": {"SPLIT-1": "2026-10-11 12:00", "EMAIL-1": "2026-10-11 12:00"}},
+    {"scenario_values": {"Holiday_DE.HStart": "2026-10-09 12:00"}, "has_row": {"Holiday_Entry": true},
+     "end_activity": "EMAIL-2", "emails_sent": ["EMAIL-2"], "manual_actions": [], "contact_count": 3,
+     "timeline": {"SPLIT-1": "2026-10-11 12:00", "WAIT-1": "2026-10-11 12:00", "EMAIL-2": "2026-10-11 12:00"}},
+    {"scenario_values": {"Holiday_DE.HStart": null}, "has_row": {"Holiday_Entry": true},
+     "end_activity": "EMAIL-3", "emails_sent": ["EMAIL-3"], "manual_actions": [], "contact_count": 3,
+     "timeline": {"SPLIT-1": "2026-10-11 12:00", "EMAIL-3": "2026-10-11 12:00"}}
+  ],
+  "validity_days": 1,
+  "unsupported": [],
+  "checks_pass": true,
+  "csv_no_space_cells": true,
+  "report_contains": ["Holiday_Entry", "Holiday_DE", ["già passata", "già nel passato"]],
+  "report_head_contains": [["2026-10-12", "12/10/2026", "12 ottobre 2026"]],
+  "testbook_contains": [["2026-10-12", "12/10/2026", "12 ottobre 2026"]],
+  "csv_rows": {"DE_HL_Entry": 9, "Holiday_Entry": 9, "Holiday_DE": 3},
+  "csv_values": {
+    "Holiday_Entry.HKey": ["TST_R01_S01", "TST_R01_S02", "TST_R01_S03"],
+    "Holiday_DE.HKey": ["TST_R01_S01", "TST_R01_S02", "TST_R01_S03"],
+    "Holiday_DE.HStart": [null, "2026-10-09 12:00", "2026-10-13 12:00"],
+    "Holiday_DE.HEnd": ["2026-10-11 12:00"]
+  }
+}
